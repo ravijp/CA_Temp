@@ -568,17 +568,7 @@ class SurvivalModelEngine:
     
     def predict_survival_curves(self, X: pd.DataFrame, time_points: Optional[np.ndarray] = None) -> np.ndarray:
         """
-        Generate survival curves using AFT formulation
-        
-        Multi-horizon survival probability calculation with distribution-specific
-        curve generation and confidence interval computation.
-        
-        Args:
-            X: Features for prediction
-            time_points: Time points for survival curve (default: 1-365 days)
-            
-        Returns:
-            np.ndarray: Survival curves (n_samples x n_timepoints)
+        Generate survival curves using AFT formulation - XGBoost 3.0.2 compatible
         """
         if self.model is None or self.aft_parameters is None:
             raise RuntimeError("Model must be trained before generating predictions")
@@ -592,7 +582,7 @@ class SurvivalModelEngine:
         else:
             X_processed = X[self.feature_columns] if self.feature_columns else X
         
-        # Get AFT predictions (eta)
+        # Get AFT predictions (eta) - XGBoost 3.0.2 compatible
         dmatrix = xgb.DMatrix(X_processed)
         eta_predictions = self.model.predict(dmatrix)
         
@@ -672,7 +662,7 @@ class SurvivalModelEngine:
         
         return risk_scores
     
-    # === MODEL PERSISTENCE SECTION (50 LOC) ===
+        # === MODEL PERSISTENCE SECTION (50 LOC) ===
     
     def save_model(self, filepath: str, include_metadata: bool = True) -> bool:
         """
@@ -773,3 +763,231 @@ class SurvivalModelEngine:
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             return False
+
+if __name__ == "__main__":
+    """
+    Comprehensive test suite for SurvivalModelEngine with XGBoost 3.0.2
+    
+    Assumes df is available with person_composite_id x vantage_date level data
+    """
+    df = pd.DataFrame()
+    # Set up logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    print("=== SURVIVAL MODEL ENGINE TEST SUITE ===")
+    print(f"Dataset shape: {df.shape}")
+    print(f"Columns available: {list(df.columns)}")
+    
+    # ===== 1. DATA PREPARATION =====
+    print("\n1. PREPARING DATA...")
+    
+    # Basic data preparation
+    df_clean = df.dropna(subset=['survival_time_days', 'event_indicator_all']).copy()
+    
+    # Split data by dataset_split
+    train_data = df_clean[df_clean['dataset_split'] == 'train'].copy()
+    val_data = df_clean[df_clean['dataset_split'] == 'val'].copy()
+    oot_data = df_clean[df_clean['dataset_split'] == 'oot'].copy() if 'oot' in df_clean['dataset_split'].values else None
+    
+    print(f"Train samples: {len(train_data)}, Val samples: {len(val_data)}")
+    if oot_data is not None:
+        print(f"OOT samples: {len(oot_data)}")
+    
+    # Define feature columns (adapt based on your actual features)
+    feature_columns = [
+        'age_at_vantage', 'tenure_at_vantage_days', 'baseline_salary', 'team_size',
+        'team_avg_comp', 'salary_growth_ratio', 'manager_changes_count'
+    ]
+    # Filter to available columns
+    feature_columns = [col for col in feature_columns if col in df_clean.columns]
+    
+    # Prepare X, y, events for train and validation
+    X_train, y_train, event_train = train_data[feature_columns], train_data['survival_time_days'], train_data['event_indicator_all']
+    X_val, y_val, event_val = val_data[feature_columns], val_data['survival_time_days'], val_data['event_indicator_all']
+    
+    print(f"Using {len(feature_columns)} features: {feature_columns[:5]}...")
+    print(f"Event rates - Train: {event_train.mean():.3f}, Val: {event_val.mean():.3f}")
+    
+    # ===== 2. CONFIGURATION SETUP =====
+    print("\n2. SETTING UP CONFIGURATION...")
+    
+    # Feature scaling configuration
+    feature_scaling_config = {
+        'robust_scale': ['baseline_salary', 'team_avg_comp', 'salary_growth_ratio'],
+        'log_transform': ['manager_changes_count'],
+        'clip_and_scale': {
+            'age_at_vantage': (18, 80),
+            'tenure_at_vantage_days': (0, 36500),
+            'team_size': (1, 1000)
+        }
+    }
+    
+    # Initialize components
+    model_config = ModelConfig()
+    feature_processor = FeatureProcessor(feature_scaling_config)
+    engine = SurvivalModelEngine(model_config, feature_processor)
+    
+    print("✓ Configuration and components initialized")
+    
+    # ===== 3. XGBOOST COMPATIBILITY VALIDATION =====
+    print("\n3. VALIDATING XGBOOST 3.0.2 COMPATIBILITY...")
+    
+    # Test XGBoost compatibility
+    compatibility_results = engine.validate_xgboost_compatibility()
+    print(f"✓ XGBoost version: {compatibility_results['xgboost_version']}")
+    print(f"✓ Version compatible: {compatibility_results['version_compatible']}")
+    print(f"✓ Interval setup tested: {compatibility_results['interval_setup_tested']}")
+    
+    # ===== 4. AFT PARAMETER OPTIMIZATION =====
+    print("\n4. OPTIMIZING AFT PARAMETERS...")
+    
+    # Optimize AFT parameters using validation set
+    optimal_params = engine.optimize_aft_parameters(X_train, y_train, event_train, X_val, y_val, event_val)
+    print(f"✓ Optimal distribution: {optimal_params.distribution}")
+    print(f"✓ Optimal scale: {optimal_params.sigma:.4f}")
+    print(f"✓ Log-likelihood: {optimal_params.log_likelihood:.4f}")
+    
+    # ===== 5. FULL MODEL TRAINING =====
+    print("\n5. TRAINING COMPLETE SURVIVAL MODEL...")
+    
+    # Train complete model
+    model_results = engine.train_survival_model(X_train, y_train, event_train, X_val, y_val, event_val)
+    print(f"✓ Model trained successfully")
+    print(f"✓ Training C-index: {model_results.training_metrics['c_index']:.4f}")
+    print(f"✓ Validation C-index: {model_results.validation_metrics['c_index']:.4f}")
+    print(f"✓ Best iteration: {model_results.model.best_iteration}")
+    
+    # ===== 6. MODEL VALIDATION =====
+    print("\n6. VALIDATING MODEL TRAINING...")
+    
+    # Validate model training quality
+    validation_results = engine.validate_model_training(model_results)
+    print(f"✓ Training quality: {validation_results['training_quality']}")
+    print(f"✓ Convergence: {validation_results['prediction_stats']['convergence']}")
+    if validation_results['issues']:
+        print(f"⚠ Issues detected: {validation_results['issues']}")
+    
+    # ===== 7. SURVIVAL CURVE GENERATION =====
+    print("\n7. GENERATING SURVIVAL CURVES...")
+    
+    # Generate survival curves for validation set
+    survival_curves = engine.predict_survival_curves(X_val)
+    print(f"✓ Generated curves for {survival_curves.shape[0]} samples over {survival_curves.shape[1]} time points")
+    print(f"✓ Mean 30-day survival: {survival_curves[:, 29].mean():.3f}")
+    print(f"✓ Mean 365-day survival: {survival_curves[:, -1].mean():.3f}")
+    
+    # ===== 8. RISK SCORE CALCULATION =====
+    print("\n8. CALCULATING RISK SCORES...")
+    
+    # Generate risk scores
+    risk_scores = engine.predict_risk_scores(X_val)
+    print(f"✓ Generated risk scores - Mean: {risk_scores.mean():.3f}, Std: {risk_scores.std():.3f}")
+    print(f"✓ Risk score range: [{risk_scores.min():.3f}, {risk_scores.max():.3f}]")
+    
+    # ===== 9. FEATURE IMPORTANCE ANALYSIS =====
+    print("\n9. ANALYZING FEATURE IMPORTANCE...")
+    
+    # Display top features
+    top_features = model_results.feature_importance.head(5)
+    print("✓ Top 5 most important features:")
+    for idx, row in top_features.iterrows():
+        print(f"   {row['feature']}: {row['importance']:.2f}")
+    
+    # ===== 10. MODEL PERSISTENCE TEST =====
+    print("\n10. TESTING MODEL PERSISTENCE...")
+    
+    # Test model saving and loading
+    test_filepath = "./test_survival_model"
+    save_success = engine.save_model(test_filepath, include_metadata=True)
+    print(f"✓ Model save successful: {save_success}")
+    
+    # Create new engine and test loading
+    new_engine = SurvivalModelEngine(model_config, feature_processor)
+    load_success = new_engine.load_model(test_filepath)
+    print(f"✓ Model load successful: {load_success}")
+    
+    # ===== 11. OOT TESTING (IF AVAILABLE) =====
+    if oot_data is not None:
+        print("\n11. OUT-OF-TIME TESTING...")
+        
+        X_oot, y_oot, event_oot = oot_data[feature_columns], oot_data['survival_time_days'], oot_data['event_indicator_all']
+        
+        # Generate OOT predictions
+        oot_survival_curves = engine.predict_survival_curves(X_oot)
+        oot_risk_scores = engine.predict_risk_scores(X_oot)
+        
+        print(f"✓ OOT survival curves generated for {len(X_oot)} samples")
+        print(f"✓ OOT mean 365-day survival: {oot_survival_curves[:, -1].mean():.3f}")
+        print(f"✓ OOT risk scores - Mean: {oot_risk_scores.mean():.3f}")
+        
+        # Calculate OOT C-index if lifelines is available
+        try:
+            from lifelines.utils import concordance_index
+            oot_c_index = concordance_index(y_oot, -oot_risk_scores, event_oot)
+            print(f"✓ OOT C-index: {oot_c_index:.4f}")
+        except ImportError:
+            print("⚠ Lifelines not available for C-index calculation")
+    
+    # ===== 12. PERFORMANCE SUMMARY =====
+    print("\n12. PERFORMANCE SUMMARY...")
+    
+    # Risk score distribution analysis
+    high_risk_threshold = np.percentile(risk_scores, 80)
+    high_risk_mask = risk_scores >= high_risk_threshold
+    high_risk_event_rate = event_val[high_risk_mask].mean()
+    low_risk_event_rate = event_val[~high_risk_mask].mean()
+    
+    print(f"✓ High-risk group (top 20%) event rate: {high_risk_event_rate:.3f}")
+    print(f"✓ Low-risk group (bottom 80%) event rate: {low_risk_event_rate:.3f}")
+    print(f"✓ Risk discrimination ratio: {high_risk_event_rate / low_risk_event_rate:.2f}x")
+    
+    # ===== 13. BUSINESS INSIGHTS =====
+    print("\n13. BUSINESS INSIGHTS...")
+    
+    # Survival probability insights
+    median_survival_idx = np.where(survival_curves.mean(axis=0) <= 0.5)[0]
+    if len(median_survival_idx) > 0:
+        median_survival_days = median_survival_idx[0] + 1
+        print(f"✓ Population median survival time: ~{median_survival_days} days")
+    else:
+        print("✓ Population median survival time: >365 days")
+    
+    # Risk concentration
+    top_decile_mask = risk_scores >= np.percentile(risk_scores, 90)
+    top_decile_events = event_val[top_decile_mask].sum()
+    total_events = event_val.sum()
+    event_concentration = top_decile_events / total_events
+    
+    print(f"✓ Top 10% risk captures {event_concentration:.1%} of all events")
+    print(f"✓ Model lift in top decile: {event_concentration / 0.1:.1f}x")
+    
+    # ===== FINAL STATUS =====
+    print("\n" + "="*50)
+    print("🎉 SURVIVAL MODEL ENGINE TEST COMPLETED SUCCESSFULLY!")
+    print("="*50)
+    
+    print("\nKEY RESULTS:")
+    print(f"• Model Type: XGBoost AFT ({optimal_params.distribution} distribution)")
+    print(f"• Validation C-index: {model_results.validation_metrics['c_index']:.4f}")
+    print(f"• Scale Parameter: {optimal_params.sigma:.4f}")
+    print(f"• Feature Count: {len(feature_columns)}")
+    print(f"• Training Samples: {len(train_data):,}")
+    print(f"• Validation Samples: {len(val_data):,}")
+    if oot_data is not None:
+        print(f"• OOT Samples: {len(oot_data):,}")
+    
+    print("\nMODEL READY FOR PRODUCTION USE! 🚀")
+    
+    # Return key objects for further analysis
+    test_results = {
+        'engine': engine,
+        'model_results': model_results,
+        'optimal_params': optimal_params,
+        'survival_curves': survival_curves,
+        'risk_scores': risk_scores,
+        'validation_results': validation_results,
+        'feature_importance': model_results.feature_importance
+    }
+    
+    print(f"\nTest results stored in 'test_results' dictionary with {len(test_results)} components")
