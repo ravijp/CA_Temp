@@ -42,7 +42,7 @@ class ModelResults:
     training_metadata: Dict[str, Any]
 
 @dataclass
-    class ModelConfig:
+class ModelConfig:
         """Core modeling configuration updated for XGBoost 3.0.2"""
         aft_distributions: List[str] = field(default_factory=lambda: ['normal', 'logistic', 'extreme'])
         scale_parameter_range: Tuple[float, float] = (0.1, 5.0)
@@ -192,6 +192,70 @@ class SurvivalModelEngine:
         
         logger.info(f"SurvivalModelEngine initialized with {len(config.aft_distributions)} AFT distributions")
     
+    def _calculate_manual_log_likelihood(self, predictions: np.ndarray, actuals: np.ndarray, 
+                                    events: np.ndarray, distribution: str, scale: float) -> float:
+        """
+        Manual log-likelihood calculation following AFT principles for XGBoost 3.0.2
+        
+        Args:
+            predictions: Model predictions (eta) on log scale
+            actuals: Actual survival times on log scale
+            events: Event indicators (1=event, 0=censored)
+            distribution: AFT distribution ('normal', 'logistic', 'extreme')
+            scale: Scale parameter (sigma)
+            
+        Returns:
+            float: Manual log-likelihood value
+        """
+        
+        # Convert to interval representation for XGBoost 3.0.2 compatibility
+        y_lower = actuals
+        y_upper = np.where(events == 1, actuals, np.inf)
+        
+        # Calculate standardized residuals: Z = (log(T) - eta) / sigma
+        z_scores_lower = (y_lower - predictions) / scale
+        
+        log_likelihood_terms = []
+        
+        for i in range(len(predictions)):
+            z_lower = z_scores_lower[i]
+            
+            if np.isinf(y_upper[i]):
+                # Right-censored: P(T > t) = S(t) = 1 - F(z)
+                if distribution == 'normal':
+                    log_prob = stats.norm.logsf(z_lower)
+                elif distribution == 'logistic':
+                    log_prob = -np.log1p(np.exp(z_lower))
+                elif distribution == 'extreme':
+                    log_prob = -np.exp(z_lower)
+                else:
+                    raise ValueError(f"Unsupported distribution: {distribution}")
+                    
+            else:
+                # Uncensored: f(t) = f(z) / (sigma * t)
+                # Note: log(1/sigma) term cancels in relative comparison
+                if distribution == 'normal':
+                    log_prob = stats.norm.logpdf(z_lower)
+                elif distribution == 'logistic':
+                    log_prob = z_lower - 2 * np.log1p(np.exp(z_lower))
+                elif distribution == 'extreme':
+                    log_prob = z_lower - np.exp(z_lower)
+                else:
+                    raise ValueError(f"Unsupported distribution: {distribution}")
+            
+            log_likelihood_terms.append(log_prob)
+        
+        # Convert to array and handle numerical stability
+        log_likelihood_terms = np.array(log_likelihood_terms)
+        valid_mask = np.isfinite(log_likelihood_terms)
+        
+        if not np.all(valid_mask):
+            n_invalid = np.sum(~valid_mask)
+            logger.warning(f"Excluded {n_invalid}/{len(log_likelihood_terms)} invalid log-likelihood terms")
+            log_likelihood_terms = log_likelihood_terms[valid_mask]
+        
+        return np.sum(log_likelihood_terms)
+
     # === AFT OPTIMIZATION SECTION (200 LOC) ===
     
     def optimize_aft_parameters(self, X_train: pd.DataFrame, y_train: pd.Series, event_train: pd.Series,
@@ -770,7 +834,7 @@ if __name__ == "__main__":
     
     Assumes df is available with person_composite_id x vantage_date level data
     """
-    df = pd.DataFrame()
+    
     # Set up logging
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
