@@ -263,6 +263,29 @@ class SurvivalEvaluation:
         self.evaluation_results = performance_results
         return performance_results
     
+    def predict_time_horizons(self, X: pd.DataFrame, horizons: List[int]) -> Dict[str, np.ndarray]:
+        """
+        Predict survival probabilities at specific time horizons
+        
+        Args:
+            X: Feature matrix
+            horizons: List of time points (e.g., [30, 90, 180, 365])
+            
+        Returns:
+            Dict: {f'{horizon}d': survival_probabilities}
+        """
+        survival_curves = self.predict_survival_curves(X, np.array(horizons))
+        
+        result = {}
+        for i, horizon in enumerate(horizons):
+            if i < survival_curves.shape[1]:
+                result[f'{horizon}d'] = survival_curves[:, i]
+            else:
+                # If horizon beyond curve, use last available point
+                result[f'{horizon}d'] = survival_curves[:, -1]
+        
+        return result
+    
     def calculate_survival_metrics(self, X: pd.DataFrame, y_true: np.ndarray, 
                                           events: np.ndarray, use_ipcw: bool = True) -> Dict:
         """
