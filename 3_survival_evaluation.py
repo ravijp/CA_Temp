@@ -97,23 +97,40 @@ class SurvivalEvaluation:
 
     def _get_processed_features(self, X: pd.DataFrame) -> pd.DataFrame:
         """
-        Expert-level feature processing compatibility handler
-        
-        Ensures feature processing consistency between evaluation framework
-        and trained SurvivalModelEngine, handling all edge cases gracefully.
+        Expert-level feature processing compatibility handler with error handling
         """
-        if (hasattr(self.model_engine, 'feature_processor') and 
-            self.model_engine.feature_processor and
-            hasattr(self.model_engine.feature_processor, 'scalers') and 
-            self.model_engine.feature_processor.scalers):
-            return self.model_engine.feature_processor._transform_test_features(X)
+        try:
+            # Strategy 1: Use fitted feature processor if available
+            if (hasattr(self.model_engine, 'feature_processor') and 
+                self.model_engine.feature_processor and
+                hasattr(self.model_engine.feature_processor, 'scalers') and 
+                self.model_engine.feature_processor.scalers):
+                return self.model_engine.feature_processor._transform_test_features(X)
+            
+            # Strategy 2: Use stored feature columns if available
+            if (hasattr(self.model_engine, 'feature_columns') and 
+                self.model_engine.feature_columns):
+                
+                # Check for missing features
+                missing_features = [f for f in self.model_engine.feature_columns if f not in X.columns]
+                if missing_features:
+                    logger.warning(f"Missing {len(missing_features)} expected features, using available features only")
+                    available_features = [f for f in self.model_engine.feature_columns if f in X.columns]
+                    if not available_features:
+                        raise SurvivalEvaluationError("No expected features found in input data")
+                    return X[available_features]
+                
+                return X[self.model_engine.feature_columns]
+            
+            # Strategy 3: Use features as-is (fallback)
+            logger.warning("Using all input features - no feature processing applied")
+            return X
+            
+        except Exception as e:
+            # Debug the issue
+            self.debug_feature_mismatch(X)
+            raise SurvivalEvaluationError(f"Feature processing failed: {str(e)}")
         
-        if (hasattr(self.model_engine, 'feature_columns') and 
-            self.model_engine.feature_columns):
-            return X[self.model_engine.feature_columns]
-        
-        return X
-
     def _validate_model_state(self) -> None:
         """Comprehensive model state validation"""
         if self.model_engine is None:
@@ -1305,6 +1322,23 @@ class SurvivalEvaluation:
             return "Model performance remains stable over time"
         else:
             return f"Performance concerns identified: {'; '.join(issues)}"
+        
+    def debug_feature_mismatch(self, X: pd.DataFrame) -> None:
+        """Debug feature mismatch issues"""
+        print(f"Input DataFrame columns ({len(X.columns)}): {list(X.columns)[:10]}...")
+        
+        if hasattr(self.model_engine, 'feature_columns') and self.model_engine.feature_columns:
+            expected_features = self.model_engine.feature_columns
+            print(f"Expected features ({len(expected_features)}): {expected_features[:10]}...")
+            
+            missing_features = [f for f in expected_features if f not in X.columns]
+            if missing_features:
+                print(f"Missing features ({len(missing_features)}): {missing_features[:10]}...")
+            
+            extra_features = [f for f in X.columns if f not in expected_features]
+            if extra_features:
+                print(f"Extra features ({len(extra_features)}): {extra_features[:10]}...")
+    
 
 if __name__ == "__main__":
     print("=== SURVIVAL EVALUATION MODULE ===")
