@@ -143,18 +143,22 @@ class SmartFeatureProcessor:
         
         if transformation_type == 'iqr_cap':
             target_col = f'{feature}_cap'
-            # Apply if target doesn't exist and feature needs this transformation
-            return target_col not in existing_columns and feature in self.feature_config.iqr_cap_features
+            # Apply if target doesn't exist, original feature exists, and feature needs this transformation
+            return (target_col not in existing_columns and 
+                    feature in existing_columns and 
+                    feature in self.feature_config.iqr_cap_features)
         
         elif transformation_type == 'log_transform':
             target_col = f'{feature}_log'
-            # Apply if target doesn't exist and feature needs this transformation
-            return target_col not in existing_columns and feature in self.feature_config.log_transform_features
+            return (target_col not in existing_columns and 
+                    feature in existing_columns and 
+                    feature in self.feature_config.log_transform_features)
         
         elif transformation_type == 'winsorize':
             target_col = f'{feature}_win_cap'
-            # Apply if target doesn't exist and feature needs this transformation
-            return target_col not in existing_columns and feature in self.feature_config.winsorize_features
+            return (target_col not in existing_columns and 
+                    feature in existing_columns and 
+                    feature in self.feature_config.winsorize_features)
         
         return False
     
