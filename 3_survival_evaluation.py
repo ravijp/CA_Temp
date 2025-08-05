@@ -540,9 +540,22 @@ class SurvivalEvaluation:
                     bin_accuracy = np.average(valid_outcomes[in_bin], weights=bin_weights)
                     bin_confidence = np.average(valid_predictions[in_bin], weights=bin_weights)
                     
+                    # Store for calibration curve
+                    fraction_positives.append(bin_accuracy)
+                    mean_predicted.append(bin_confidence)
+                    
                     # ECE contribution for this bin
                     ece_sum += bin_weight_sum * abs(bin_accuracy - bin_confidence)
                     total_weight += bin_weight_sum
+            else:
+                # Empty bin - use bin center for plotting
+                bin_center = (bin_edges[i] + bin_edges[i + 1]) / 2
+                fraction_positives.append(bin_center)  # Neutral assumption
+                mean_predicted.append(bin_center)
+        
+        # Convert to numpy arrays for consistent return format
+        fraction_positives = np.array(fraction_positives)
+        mean_predicted = np.array(mean_predicted)
         
         # Final ECE calculation
         if total_weight <= 0:
@@ -562,6 +575,8 @@ class SurvivalEvaluation:
             },
             'total_weight': total_weight
         }
+    
+    
     def perform_comprehensive_diagnostics(self, X: pd.DataFrame, y: np.ndarray, 
                                          events: np.ndarray, dataset_name: str = 'validation') -> Dict:
         """
