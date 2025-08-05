@@ -400,9 +400,7 @@ class SurvivalEvaluation:
     def _calculate_censoring_aware_calibration(self, X: pd.DataFrame, y_true: np.ndarray, 
                                         events: np.ndarray, horizon: int) -> Dict:
         """
-        Methodologically corrected censoring-aware calibration using proper IPCW
-        
-        Fixes APPLIED:
+        censoring-aware calibration using brier_score module components
         1. All observations contribute with proper IPCW weights (no zero weights for censored)
         2. Correct weight formula: 1/G(min(T_i, t)) where G is censoring survival function
         3. Robust binning strategy for weighted calibration curve
@@ -415,171 +413,148 @@ class SurvivalEvaluation:
             horizon: Time horizon for calibration assessment
             
         Returns:
-            Dict: Same structure as original - {'ece': float, 'calibration_curve': dict, 'total_weight': float}
+            Dict: {'ece': float, 'calibration_curve': dict, 'total_weight': float}
         """
         
-        try:
-            # Get model predictions - same as original
-            X_processed = self._get_processed_features(X)
-            horizon_survival = self.predict_time_horizons(X_processed, [horizon])
-            predicted_probs = 1 - horizon_survival[f'{horizon}d']
-            
-            #  Fit censoring distribution correctly
+        # Get model predictions
+        X_processed = self._get_processed_features(X)
+        horizon_survival = self.predict_time_horizons(X_processed, [horizon])
+        predicted_event_probs = 1 - horizon_survival[f'{horizon}d']
+        
+        # Import proven IPCW implementation
+        from brier_score import IPCWEstimator
+        
+        # Calculate IPCW weights using proven methodology
+        ipcw_weights = IPCWEstimator.kaplan_meier_weights(
+            times=y_true,
+            events=events,
+            eval_times=np.array([horizon])
+        )
+        
+        # Validate IPCW weights
+        if len(ipcw_weights) != len(y_true):
+            raise ValueError(f"IPCW weights length {len(ipcw_weights)} != data length {len(y_true)}")
+        
+        # Define binary outcomes at horizon using vectorized operations
+        # Key insight: outcome = 1 if event occurred by horizon, 0 otherwise
+        binary_outcomes = np.zeros(len(y_true), dtype=float)
+        event_by_horizon = (y_true <= horizon) & (events == 1)
+        binary_outcomes[event_by_horizon] = 1.0
+        
+        # Apply IPCW correction for calibration context
+        # Standard IPCW gives weights for events, but we need all observations weighted
+        calibration_weights = np.ones(len(y_true), dtype=float)
+        
+        # For event observations: use IPCW weights directly
+        event_mask = events == 1
+        calibration_weights[event_mask] = ipcw_weights[event_mask]
+        
+        # For censored observations: weight by inverse censoring probability at horizon
+        censored_mask = events == 0
+        if np.any(censored_mask):
             from lifelines import KaplanMeierFitter
-            kmf = KaplanMeierFitter()
-            kmf.fit(y_true, 1 - events)  # Censoring distribution: G(t) = P(C > t)
             
-            #  Calculate methodologically correct IPCW weights
-            # KEY INSIGHT: ALL observations contribute, weighted by censoring probability
-            weights = np.zeros(len(y_true))
-            outcome = np.zeros(len(y_true))
+            kmf_censor = KaplanMeierFitter()
+            kmf_censor.fit(y_true, 1 - events)  # Fit censoring distribution
             
-            for i, (time, event) in enumerate(zip(y_true, events)):
-                # Evaluation time for IPCW weight calculation
-                eval_time = min(time, horizon)
-                
-                try:
-                    if eval_time > 0:
-                        # Get censoring survival probability at evaluation time
-                        censor_surv_prob = kmf.survival_function_at_times([eval_time]).values[0, 0]
-                        # CORRECTED IPCW FORMULA: Weight = 1 / P(C > min(T_i, t))
-                        weights[i] = 1.0 / max(censor_surv_prob, 0.01)
-                    else:
-                        weights[i] = 1.0
-                except:
-                    # Fallback for edge cases
-                    weights[i] = 1.0
-                
-                #  Proper outcome definition based on observable information
-                if time <= horizon:
-                    # We observe the outcome by horizon
-                    outcome[i] = float(event == 1)  # 1 if event occurred, 0 if censored
+            # Vectorized weight calculation for censored observations
+            censored_times = y_true[censored_mask]
+            eval_times = np.minimum(censored_times, horizon)
+            
+            # Get censoring survival probabilities
+            censor_surv_probs = []
+            for eval_time in eval_times:
+                if eval_time > 0:
+                    surv_prob = kmf_censor.survival_function_at_times([eval_time]).iloc[0, 0]
+                    censor_surv_probs.append(max(surv_prob, 0.01))
                 else:
-                    # Time > horizon: we know no event occurred by horizon
-                    outcome[i] = 0.0
+                    censor_surv_probs.append(1.0)
             
-            #  Remove invalid weights (should be rare with correct implementation)
-            valid_mask = (weights > 0) & np.isfinite(weights) & np.isfinite(predicted_probs)
+            # Apply censoring weights
+            calibration_weights[censored_mask] = 1.0 / np.array(censor_surv_probs)
+        
+        # Validation: ensure all weights are valid
+        if not np.all(np.isfinite(calibration_weights)) or not np.all(calibration_weights > 0):
+            raise ValueError("Invalid calibration weights detected")
+        
+        if len(predicted_event_probs) != len(binary_outcomes):
+            raise ValueError("Prediction and outcome length mismatch")
+        
+        # Remove any invalid predictions or outcomes
+        valid_mask = (
+            np.isfinite(predicted_event_probs) & 
+            np.isfinite(binary_outcomes) & 
+            np.isfinite(calibration_weights) &
+            (calibration_weights > 0)
+        )
+        
+        n_valid = np.sum(valid_mask)
+        if n_valid < 10:
+            raise ValueError(f"Insufficient valid observations: {n_valid} < 10")
+        
+        # Apply validity mask
+        valid_predictions = predicted_event_probs[valid_mask]
+        valid_outcomes = binary_outcomes[valid_mask]
+        valid_weights = calibration_weights[valid_mask]
+        
+        # Calculate calibration curve using sklearn with uniform binning
+        from sklearn.calibration import calibration_curve
+        
+        fraction_positives, mean_predicted = calibration_curve(
+            valid_outcomes,
+            valid_predictions,
+            n_bins=self.config.calibration_bins,
+            sample_weight=valid_weights,
+            strategy='uniform'
+        )
+        
+        # Calculate ECE manually with proper weight handling
+        n_bins = self.config.calibration_bins
+        bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+        
+        ece_sum = 0.0
+        total_weight = 0.0
+        
+        for i in range(n_bins):
+            # Define bin boundaries
+            if i == n_bins - 1:
+                # Last bin includes upper boundary
+                in_bin = (valid_predictions >= bin_edges[i]) & (valid_predictions <= bin_edges[i + 1])
+            else:
+                in_bin = (valid_predictions >= bin_edges[i]) & (valid_predictions < bin_edges[i + 1])
             
-            if np.sum(valid_mask) < 10:
-                return {
-                    'ece': np.nan, 
-                    'calibration_curve': {'fraction_positives': np.array([]), 'mean_predicted': np.array([])},
-                    'total_weight': 0.0,
-                    'error': 'Insufficient valid observations after IPCW weighting'
-                }
-            
-            # Apply validity mask
-            valid_outcome = outcome[valid_mask]
-            valid_predicted = predicted_probs[valid_mask]
-            valid_weights = weights[valid_mask]
-            
-            #  Robust calibration curve calculation
-            try:
-                # Use uniform binning strategy for stability with weighted data
-                fraction_positives, mean_predicted = calibration_curve(
-                    valid_outcome, valid_predicted, 
-                    n_bins=self.config.calibration_bins,
-                    sample_weight=valid_weights, 
-                    strategy='uniform'  # CHANGED: uniform is more stable than quantile for weighted data
-                )
+            n_in_bin = np.sum(in_bin)
+            if n_in_bin > 0:
+                bin_weights = valid_weights[in_bin]
+                bin_weight_sum = np.sum(bin_weights)
                 
-                #  Manual ECE calculation with proper weight handling
-                # Use uniform bin edges for consistent weight distribution
-                bin_edges = np.linspace(0, 1, self.config.calibration_bins + 1)
-                bin_indices = np.digitize(valid_predicted, bin_edges) - 1
-                bin_indices = np.clip(bin_indices, 0, self.config.calibration_bins - 1)
-                
-                ece = 0.0
-                total_weight = 0.0
-                
-                # Calculate ECE with proper weight normalization
-                for bin_idx in range(self.config.calibration_bins):
-                    bin_mask = bin_indices == bin_idx
+                if bin_weight_sum > 0:
+                    # Weighted bin statistics
+                    bin_accuracy = np.average(valid_outcomes[in_bin], weights=bin_weights)
+                    bin_confidence = np.average(valid_predictions[in_bin], weights=bin_weights)
                     
-                    if np.any(bin_mask):
-                        bin_weight = np.sum(valid_weights[bin_mask])
-                        
-                        if bin_weight > 0:
-                            # Weighted accuracy and confidence for this bin
-                            bin_accuracy = np.average(valid_outcome[bin_mask], weights=valid_weights[bin_mask])
-                            bin_confidence = np.average(valid_predicted[bin_mask], weights=valid_weights[bin_mask])
-                            
-                            # ECE contribution from this bin
-                            ece += bin_weight * abs(bin_accuracy - bin_confidence)
-                            total_weight += bin_weight
-                
-                # Normalize ECE by total weight
-                ece = ece / total_weight if total_weight > 0 else np.nan
-                
-                return {
-                    'ece': ece,
-                    'calibration_curve': {
-                        'fraction_positives': fraction_positives,
-                        'mean_predicted': mean_predicted
-                    },
-                    'total_weight': total_weight,
-                    'n_valid_obs': np.sum(valid_mask)  # Additional diagnostic
-                }
-                
-            except Exception as calib_error:
-                #  Fallback ECE calculation if calibration_curve fails
-                try:
-                    # Simple weighted Brier score as ECE proxy
-                    brier_score = np.average((valid_outcome - valid_predicted)**2, weights=valid_weights)
-                    ece_proxy = min(brier_score, 1.0)  # Cap at 1.0 for reasonable ECE range
-                    
-                    return {
-                        'ece': ece_proxy,
-                        'calibration_curve': {
-                            'fraction_positives': np.array([np.average(valid_outcome, weights=valid_weights)]),
-                            'mean_predicted': np.array([np.average(valid_predicted, weights=valid_weights)])
-                        },
-                        'total_weight': np.sum(valid_weights),
-                        'fallback_method': 'brier_proxy'
-                    }
-                    
-                except:
-                    return {
-                        'ece': np.nan,
-                        'calibration_curve': {'fraction_positives': np.array([]), 'mean_predicted': np.array([])},
-                        'total_weight': 0.0,
-                        'error': f'All calibration methods failed: {str(calib_error)}'
-                    }
-                    
-        except Exception as e:
-            # Maintain original return structure even on complete failure
-            return {
-                'ece': np.nan,
-                'calibration_curve': {'fraction_positives': np.array([]), 'mean_predicted': np.array([])},
-                'total_weight': 0.0,
-                'error': f'IPCW calibration failed: {str(e)}'
-            }
-
-
-    # VALIDATION: Key differences from problematic original implementation:
-
-    # ORIGINAL (PROBLEMATIC):
-    # ```python
-    # if event == 1:
-    #     surv_prob = kmf.survival_function_at_times([time]).values[0, 0]
-    #     weights[i] = 1.0 / max(surv_prob, 0.01)
-    # else:
-    #     weights[i] = 0.0  # ← WRONG: Censored observations get zero weight
-    # ```
-
-    # CORRECTED (ABOVE):
-    # ```python
-    # eval_time = min(time, horizon)  # ← Key insight: weight by evaluation time
-    # censor_surv_prob = kmf.survival_function_at_times([eval_time]).values[0, 0]
-    # weights[i] = 1.0 / max(censor_surv_prob, 0.01)  # ← ALL observations get non-zero weights
-    # ```
-
-    # METHODOLOGICAL VALIDATION:
-    # - Weight formula: 1/G(min(T_i, t)) is statistically correct for IPCW
-    # - All observations contribute information about calibration
-    # - Censored observations tell us "no event occurred by censoring time"
-    # - This preserves the complete likelihood under censoring
+                    # ECE contribution for this bin
+                    ece_sum += bin_weight_sum * abs(bin_accuracy - bin_confidence)
+                    total_weight += bin_weight_sum
+        
+        # Final ECE calculation
+        if total_weight <= 0:
+            raise ValueError("Total weight is zero or negative")
+        
+        final_ece = ece_sum / total_weight
+        
+        # Validate ECE is in reasonable range
+        if not (0 <= final_ece <= 1):
+            raise ValueError(f"ECE out of valid range [0,1]: {final_ece}")
+        
+        return {
+            'ece': final_ece,
+            'calibration_curve': {
+                'fraction_positives': fraction_positives,
+                'mean_predicted': mean_predicted
+            },
+            'total_weight': total_weight
+        }
 
     def perform_comprehensive_diagnostics(self, X: pd.DataFrame, y: np.ndarray, 
                                          events: np.ndarray, dataset_name: str = 'validation') -> Dict:
