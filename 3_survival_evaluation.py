@@ -95,6 +95,25 @@ class SurvivalEvaluation:
         self._validate_model_state()
         self._initialize_brier_calculator()
 
+    def _get_processed_features(self, X: pd.DataFrame) -> pd.DataFrame:
+        """
+        Expert-level feature processing compatibility handler
+        
+        Ensures feature processing consistency between evaluation framework
+        and trained SurvivalModelEngine, handling all edge cases gracefully.
+        """
+        if (hasattr(self.model_engine, 'feature_processor') and 
+            self.model_engine.feature_processor and
+            hasattr(self.model_engine.feature_processor, 'scalers') and 
+            self.model_engine.feature_processor.scalers):
+            return self.model_engine.feature_processor._transform_test_features(X)
+        
+        if (hasattr(self.model_engine, 'feature_columns') and 
+            self.model_engine.feature_columns):
+            return X[self.model_engine.feature_columns]
+        
+        return X
+
     def _validate_model_state(self) -> None:
         """Comprehensive model state validation"""
         if self.model_engine is None:
@@ -244,7 +263,8 @@ class SurvivalEvaluation:
         metrics = {}
         
         try:
-            dmatrix = xgb.DMatrix(X)
+            X_processed = self._get_processed_features(X)
+            dmatrix = xgb.DMatrix(X_processed)
             log_predictions = self.model_engine.model.predict(dmatrix)
             pred_times = np.expm1(log_predictions)
             
@@ -342,7 +362,8 @@ class SurvivalEvaluation:
         """Implement proper censoring-aware calibration using inverse probability weighting"""
         
         try:
-            horizon_survival = self.model_engine.predict_time_horizons(X, [horizon])
+            X_processed = self._get_processed_features(X)
+            horizon_survival = self.model_engine.predict_time_horizons(X_processed, [horizon])
             predicted_probs = 1 - horizon_survival[f'{horizon}d']
             
             kmf = KaplanMeierFitter()
@@ -412,8 +433,8 @@ class SurvivalEvaluation:
         
         diagnostic_results = {}
         
-        # Generate predictions
-        dmatrix = xgb.DMatrix(X)
+        X_processed = self._get_processed_features(X)
+        dmatrix = xgb.DMatrix(X_processed)
         raw_predictions = self.model_engine.model.predict(dmatrix)
         
         # AFT assumption validation
@@ -553,7 +574,8 @@ class SurvivalEvaluation:
         """
         validation_results = {}
         
-        dmatrix = xgb.DMatrix(X)
+        X_processed = self._get_processed_features(X)
+        dmatrix = xgb.DMatrix(X_processed)
         log_predictions = self.model_engine.model.predict(dmatrix)
         predicted_times = np.expm1(log_predictions)
         risk_scores = self.model_engine.predict_risk_scores(X)
@@ -595,20 +617,17 @@ class SurvivalEvaluation:
         """
         print(f"\nGenerating diagnostic plots for {dataset_name}...")
         
-        # Generate predictions
-        dmatrix = xgb.DMatrix(X)
+        X_processed = self._get_processed_features(X)
+        dmatrix = xgb.DMatrix(X_processed)
         predictions = self.model_engine.model.predict(dmatrix)
         
-        # 1. Zero-truncated survival time distributions
         self._create_censoring_aware_kde(y, events, f'{dataset_name}_survival_times')
         
-        # 2. Residual diagnostic plots
         self._plot_residual_diagnostics(predictions, y, events, dataset_name)
         
-        # 3. Multi-horizon calibration plots
         self._plot_multi_horizon_calibration(predictions, y, events, 
                                            self.config.time_horizons, dataset_name)
-        # 4. Risk score distribution analysis
+        
         risk_scores = self.model_engine.predict_risk_scores(X)
         self._plot_risk_score_analysis(risk_scores, events, dataset_name)
         
@@ -647,7 +666,8 @@ class SurvivalEvaluation:
         
         for horizon in horizons:
             try:
-                horizon_survival = self.model_engine.predict_time_horizons(X, [horizon])
+                X_processed = self._get_processed_features(X)
+                horizon_survival = self.model_engine.predict_time_horizons(X_processed, [horizon])
                 predicted_risk = 1 - horizon_survival[f'{horizon}d']
                 
                 outcome = ((y <= horizon) & (events == 1)).astype(int)
@@ -674,7 +694,8 @@ class SurvivalEvaluation:
         """
         
         try:
-            horizon_survival = self.model_engine.predict_time_horizons(X, [365])
+            X_processed = self._get_processed_features(X)
+            horizon_survival = self.model_engine.predict_time_horizons(X_processed, [365])
             risk_scores = 1 - horizon_survival['365d']
             
             risk_scores = np.clip(risk_scores, 1e-6, 1 - 1e-6)
@@ -718,7 +739,8 @@ class SurvivalEvaluation:
         Memory-efficient survival curve quality assessment using business horizons only
         """
         try:
-            horizon_survival = self.model_engine.predict_time_horizons(X, [30, 90, 180, 365])
+            X_processed = self._get_processed_features(X)
+            horizon_survival = self.model_engine.predict_time_horizons(X_processed, [30, 90, 180, 365])
             
             final_survival = horizon_survival['365d']
             initial_survival = horizon_survival['30d']
@@ -1170,16 +1192,15 @@ class SurvivalEvaluation:
         if not degradation:
             return "No degradation data available"
         
-        # Count severe degradations
         severe_count = 0
         total_count = 0
         
         for metric, deg in degradation.items():
             if not np.isnan(deg):
                 total_count += 1
-                if metric == 'average_ece' and deg > 0.05:  # ECE increased by >5%
+                if metric == 'average_ece' and deg > 0.05:
                     severe_count += 1
-                elif metric in ['c_index', 'gini_coefficient'] and deg > 0.05:  # Dropped by >5%
+                elif metric in ['c_index', 'gini_coefficient'] and deg > 0.05:
                     severe_count += 1
         
         if total_count == 0:
@@ -1197,7 +1218,8 @@ class SurvivalEvaluation:
                                     events: np.ndarray) -> float:
         """Simple Brier score fallback calculation"""
         try:
-            horizon_survival = self.model_engine.predict_time_horizons(X, [365])
+            X_processed = self._get_processed_features(X)
+            horizon_survival = self.model_engine.predict_time_horizons(X_processed, [365])
             predicted_probs = 1 - horizon_survival['365d']
             
             outcome = ((y_true <= 365) & (events == 1)).astype(float)
