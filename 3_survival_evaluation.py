@@ -435,11 +435,25 @@ class SurvivalEvaluation:
         if len(ipcw_weights) != len(y_true):
             raise ValueError(f"IPCW weights length {len(ipcw_weights)} != data length {len(y_true)}")
         
-        # Define binary outcomes at horizon using vectorized operations
-        # Key insight: outcome = 1 if event occurred by horizon, 0 otherwise
+        # Define binary outcomes at horizon with methodologically correct logic
+        # Three cases for calibration outcome:
+        # 1. Event occurred by horizon: outcome = 1
+        # 2. Survived past horizon: outcome = 0 (definitive)  
+        # 3. Censored before horizon: outcome = 0 (but requires IPCW correction)
+        
         binary_outcomes = np.zeros(len(y_true), dtype=float)
+        
+        # Case 1: Event occurred at or before horizon
         event_by_horizon = (y_true <= horizon) & (events == 1)
         binary_outcomes[event_by_horizon] = 1.0
+        
+        # Case 2: Survived past horizon (definitive no-event by horizon)
+        survived_past_horizon = (y_true > horizon)
+        binary_outcomes[survived_past_horizon] = 0.0
+        
+        # Case 3: Censored before horizon (ambiguous - handled by IPCW)
+        censored_before_horizon = (y_true <= horizon) & (events == 0)
+        binary_outcomes[censored_before_horizon] = 0.0  # Default to 0, corrected by IPCW
         
         # Apply IPCW correction for calibration context
         # Standard IPCW gives weights for events, but we need all observations weighted
@@ -555,7 +569,6 @@ class SurvivalEvaluation:
             },
             'total_weight': total_weight
         }
-
     def perform_comprehensive_diagnostics(self, X: pd.DataFrame, y: np.ndarray, 
                                          events: np.ndarray, dataset_name: str = 'validation') -> Dict:
         """
