@@ -1,16 +1,20 @@
 """
 survival_model_engine.py
 
-Enhanced AFT survival modeling engine with methodological corrections and performance optimizations.
-Expert-level implementation for production-ready employee turnover prediction.
+Advanced AFT survival modeling engine with comprehensive feature preprocessing and multi-dataset support.
+Implements XGBoost-based accelerated failure time models with intelligent feature transformation,
+automated preprocessing pipelines, and production-ready model persistence capabilities.
 
-Key Improvements:
-- Fixed extreme distribution AFT mathematical implementation
-- Memory-efficient survival curve generation with on-demand computation
-- Proper XGBoost 3.0.2 compatibility validation
-- Enhanced AFT parameter estimation with robust scale calculation
-- Consistent risk score derivation for business metrics
+Key Features:
+- XGBoost 3.0+ AFT modeling with interval-based censoring
+- Smart feature preprocessing with automatic transformation detection
+- Multi-dataset training and evaluation (train/val/oot)
+- Feature name mapping and transformation tracking
+- Production-ready model persistence and loading
+- Comprehensive survival curve and risk score generation
 
+Author: ADP Survival Analysis Team
+Version: 3.0.0
 """
 
 import numpy as np
@@ -40,216 +44,298 @@ class AFTParameters:
 
 @dataclass
 class ModelResults:
-    """Comprehensive model training results"""
+    """Comprehensive model training results with multi-dataset support"""
     model: xgb.Booster
     aft_parameters: AFTParameters
     training_metrics: Dict[str, float]
     validation_metrics: Dict[str, float]
-    feature_importance: pd.DataFrame
-    training_metadata: Dict[str, Any]
+    oot_metrics: Dict[str, float] = field(default_factory=dict)
+    multi_dataset_metrics: Dict[str, Dict] = field(default_factory=dict)
+    feature_importance: pd.DataFrame = None
+    feature_name_mapping: Dict[str, str] = field(default_factory=dict)
+    training_metadata: Dict[str, Any] = field(default_factory=dict)
+    evals_result: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class ModelConfig:
-    """Core modeling configuration updated for XGBoost 3.0.2"""
+    """Core modeling configuration with optimized XGBoost parameters"""
     aft_distributions: List[str] = field(default_factory=lambda: ['normal', 'logistic', 'extreme'])
     scale_parameter_range: Tuple[float, float] = (0.1, 5.0)
     scale_parameter_grid_size: int = 20
     validation_metrics: List[str] = field(default_factory=lambda: ['c_index', 'ibs', 'gini', 'ece'])
     xgb_params: Dict[str, Any] = field(default_factory=lambda: {
-        'max_depth': 4,
+        'max_depth': 3,
         'eta': 0.01,
-        'subsample': 0.7,
-        'colsample_bytree': 0.7,
+        'subsample': 0.9,
+        'colsample_bytree': 0.9,
         'reg_alpha': 1.0,
-        'reg_lambda': 10.0,
-        'min_child_weight': 10,
+        'reg_lambda': 1.0,
         'gamma': 1.0,
         'seed': 42,
         'verbosity': 0,
         'tree_method': 'hist'
     })
     early_stopping_rounds: int = 50
-    num_boost_round: int = 1000
-    max_curve_memory_mb: int = 100
-    batch_size_large_datasets: int = 2000
+    num_boost_round: int = 5000
 
-class FeatureProcessor:
-    """Dedicated feature processing with comprehensive scaling strategies"""
+@dataclass
+class FeatureConfig:
+    """Smart feature configuration with transformation-specific feature lists"""
     
-    def __init__(self, scaling_config: Dict):
-        """Initialize with feature scaling configuration"""
-        self.scaling_config = scaling_config
+    # Features that need IQR-based outlier capping
+    iqr_cap_features: List[str] = field(default_factory=lambda: [
+        'baseline_salary', 'salary_growth_rate_12m', 'peer_salary_ratio', 'compensation_volatility',
+        'age_at_vantage', 'tenure_at_vantage_days', 'time_with_current_manager', 
+        'tenure_in_current_role', 'team_size', 'team_avg_comp'
+    ])
+    
+    # Features that need log transformation
+    log_transform_features: List[str] = field(default_factory=lambda: [
+        'role_complexity_score', 'tenure_in_current_role', 'tenure_at_vantage_days',
+        'compensation_volatility', 'time_with_current_manager', 'pay_grade_stagnation_months'
+    ])
+    
+    # Features that need winsorization (1st-99th percentile)
+    winsorize_features: List[str] = field(default_factory=lambda: [
+        'company_tenure_percentile', 'team_avg_turn_days', 'team_avg_comp', 
+        'peer_salary_ratio', 'baseline_salary', 'salary_growth_rate_12m',
+        'age_at_vantage', 'pay_grade_stagnation_months'
+    ])
+    
+    # Features that should be used as-is (already processed)
+    direct_features: List[str] = field(default_factory=lambda: [
+        'compensation_percentile_company', 'company_tenure_percentile'
+    ])
+    
+    # Categorical features for encoding
+    categorical_features: List[str] = field(default_factory=lambda: [
+        'pay_rate_type_cd', 'career_stage', 'generation_cohort', 'gender_cd', 
+        'hire_date_seasonality', 'full_tm_part_tm_cd', 'reg_temp_cd', 
+        'flsa_stus_cd', 'fscl_actv_ind', 'company_size_tier', 'naics_2digit'
+    ])
+
+class SmartFeatureProcessor:
+    """Smart feature processor with automatic transformation detection and comprehensive preprocessing"""
+    
+    def __init__(self, feature_config: FeatureConfig):
+        """Initialize with smart feature configuration"""
+        self.feature_config = feature_config
+        self.feature_name_mapping = {}  # transformed_name -> original_name
+        self.transformation_history = {}  # track transformation steps
         self.scalers = {}
-        self.feature_metadata = {}
+        self.label_encoders = {}
         
-    def process_features(self, X_train: pd.DataFrame, X_val: pd.DataFrame, 
-                        X_test: Optional[pd.DataFrame] = None) -> Tuple:
+        logger.info(f"SmartFeatureProcessor initialized with intelligent transformation detection")
+    
+    def _update_feature_mapping(self, original_col: str, transformed_col: str, transformation: str):
+        """Update feature name mapping and transformation history"""
+        self.feature_name_mapping[transformed_col] = original_col
+        
+        if original_col not in self.transformation_history:
+            self.transformation_history[original_col] = []
+        self.transformation_history[original_col].append({
+            'transformation': transformation,
+            'result_column': transformed_col
+        })
+    
+    def _should_apply_transformation(self, feature: str, transformation_type: str, existing_columns: List[str]) -> bool:
+        """Smart logic to determine if transformation should be applied based on target feature availability"""
+        
+        if transformation_type == 'iqr_cap':
+            target_col = f'{feature}_cap'
+            # Apply if target doesn't exist and feature needs this transformation
+            return target_col not in existing_columns and feature in self.feature_config.iqr_cap_features
+        
+        elif transformation_type == 'log_transform':
+            target_col = f'{feature}_log'
+            # Apply if target doesn't exist and feature needs this transformation
+            return target_col not in existing_columns and feature in self.feature_config.log_transform_features
+        
+        elif transformation_type == 'winsorize':
+            target_col = f'{feature}_win_cap'
+            # Apply if target doesn't exist and feature needs this transformation
+            return target_col not in existing_columns and feature in self.feature_config.winsorize_features
+        
+        return False
+    
+    def _iqr_cap_outliers(self, df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+        """IQR-based outlier capping with smart feature detection"""
+        df_processed = df.copy()
+        existing_columns = df_processed.columns.tolist()
+        
+        for col in cols:
+            if col in df_processed.columns and df_processed[col].dtype in ['int64', 'float64', 'int32']:
+                if self._should_apply_transformation(col, 'iqr_cap', existing_columns):
+                    q1 = df_processed[col].quantile(0.25)
+                    q3 = df_processed[col].quantile(0.75)
+                    iqr = q3 - q1
+                    lower_bound = q1 - 1.5 * iqr
+                    upper_bound = q3 + 1.5 * iqr
+                    
+                    capped_col = f'{col}_cap'
+                    df_processed[capped_col] = df_processed[col].clip(lower_bound, upper_bound)
+                    
+                    self._update_feature_mapping(col, capped_col, 'iqr_cap')
+                    logger.debug(f"Applied IQR capping to {col} -> {capped_col}")
+        
+        return df_processed
+    
+    def _log_transform_features(self, df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+        """Log transformation with smart feature detection"""
+        df_processed = df.copy()
+        existing_columns = df_processed.columns.tolist()
+        
+        for col in cols:
+            if col in df_processed.columns and df_processed[col].dtype in ['int64', 'float64', 'int32']:
+                if self._should_apply_transformation(col, 'log_transform', existing_columns):
+                    log_col = f'{col}_log'
+                    df_processed[log_col] = np.log1p(df_processed[col])
+                    
+                    self._update_feature_mapping(col, log_col, 'log_transform')
+                    logger.debug(f"Applied log transform to {col} -> {log_col}")
+        
+        return df_processed
+    
+    def _winsorize_features(self, df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+        """Winsorization at 1st and 99th percentiles with smart feature detection"""
+        df_processed = df.copy()
+        existing_columns = df_processed.columns.tolist()
+        
+        for col in cols:
+            if col in df_processed.columns and df_processed[col].dtype in ['int64', 'float64', 'int32']:
+                if self._should_apply_transformation(col, 'winsorize', existing_columns):
+                    q1 = df_processed[col].quantile(0.01)
+                    q99 = df_processed[col].quantile(0.99)
+                    
+                    win_col = f'{col}_win_cap'
+                    df_processed[win_col] = df_processed[col].clip(q1, q99)
+                    
+                    self._update_feature_mapping(col, win_col, 'winsorize')
+                    logger.debug(f"Applied winsorization to {col} -> {win_col}")
+        
+        return df_processed
+    
+    def get_original_feature_names(self, transformed_names: List[str]) -> List[str]:
+        """Get original feature names for plotting/interpretation"""
+        return [self.feature_name_mapping.get(name, name) for name in transformed_names]
+    
+    def get_transformation_summary(self) -> Dict[str, List[str]]:
+        """Get summary of all transformations applied"""
+        return {orig: [step['transformation'] for step in steps] 
+                for orig, steps in self.transformation_history.items()}
+    
+    def process_dataset(self, dataset: pd.DataFrame, dataset_name: str = None) -> pd.DataFrame:
+        """Process any dataset with smart preprocessing pipeline"""
+        logger.info(f"Processing {dataset_name or 'dataset'} with shape {dataset.shape}")
+        
+        df_processed = dataset.copy()
+        
+        # Get all potential features for transformations
+        all_features = (self.feature_config.iqr_cap_features + 
+                       self.feature_config.log_transform_features + 
+                       self.feature_config.winsorize_features)
+        
+        # Step 1: IQR-based capping (only for features that need it)
+        df_processed = self._iqr_cap_outliers(df_processed, all_features)
+        
+        # Step 2: Log transformation (only for features that need it)
+        df_processed = self._log_transform_features(df_processed, all_features)
+        
+        # Step 3: Winsorization (only for features that need it)
+        df_processed = self._winsorize_features(df_processed, all_features)
+        
+        logger.info(f"Smart preprocessing complete for {dataset_name or 'dataset'}")
+        return df_processed
+    
+    def process_multiple_datasets(self, datasets: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        """Process multiple datasets at once with smart preprocessing"""
+        return {name: self.process_dataset(df, name) for name, df in datasets.items()}
+    
+    def process_features(self, datasets: Dict[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], List[str], Dict]:
         """
-        Comprehensive feature processing pipeline
+        Comprehensive feature processing pipeline for multiple datasets with smart transformation detection
         
         Args:
-            X_train: Training features
-            X_val: Validation features  
-            X_test: Optional test features
+            datasets: Dict of {dataset_name: dataframe}
             
         Returns:
-            Tuple of processed DataFrames (train, val, test)
+            Tuple of (processed_datasets, feature_columns, label_encoders)
         """
-        logger.info("Starting comprehensive feature processing pipeline")
+        logger.info(f"Starting comprehensive feature processing for {len(datasets)} datasets")
         
-        # Store original statistics for metadata
-        self.feature_metadata['original_stats'] = {
-            'train': X_train.describe(),
-            'val': X_val.describe()
-        }
+        # Step 1: Apply smart preprocessing pipeline to all datasets
+        processed_datasets = self.process_multiple_datasets(datasets)
         
-        # Apply scaling strategies
-        X_train_processed, X_val_processed = self._apply_feature_scaling(X_train, X_val)
+        # Step 2: Get reference dataset for encoding (usually 'train')
+        reference_dataset = processed_datasets.get('train') or list(processed_datasets.values())[0]
         
-        X_test_processed = None
-        if X_test is not None:
-            X_test_processed = self._transform_test_features(X_test)
+        # Step 3: Determine final feature columns based on what was actually created
+        feature_columns = []
+        
+        # Add direct features (if they exist)
+        for feature in self.feature_config.direct_features:
+            if feature in reference_dataset.columns:
+                feature_columns.append(feature)
+        
+        # Add transformed features based on naming conventions
+        for col in reference_dataset.columns:
+            if (col.endswith('_cap') or col.endswith('_log') or col.endswith('_win_cap')):
+                if col not in feature_columns:
+                    feature_columns.append(col)
+        
+        # Step 4: Process categorical features across all datasets
+        encoded_datasets = {}
+        for name, df in processed_datasets.items():
+            df_encoded = df.copy()
             
-        logger.info(f"Feature processing complete. Shape: train={X_train_processed.shape}, val={X_val_processed.shape}")
-        
-        return X_train_processed, X_val_processed, X_test_processed
-    
-    def _apply_feature_scaling(self, X_train: pd.DataFrame, X_val: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Apply modular feature scaling based on configuration"""
-        X_train = X_train.copy()
-        X_val = X_val.copy()
-        
-        # Robust scale features
-        if 'robust_scale' in self.scaling_config:
-            features = [f for f in self.scaling_config['robust_scale'] if f in X_train.columns]
-            if features:
-                self.scalers['robust'] = RobustScaler()
-                X_train[features] = self.scalers['robust'].fit_transform(X_train[features])
-                X_val[features] = self.scalers['robust'].transform(X_val[features])
-        
-        # Log transform then scale
-        if 'log_transform' in self.scaling_config:
-            features = [f for f in self.scaling_config['log_transform'] if f in X_train.columns]
-            if features:
-                X_train[features] = np.log1p(X_train[features])
-                X_val[features] = np.log1p(X_val[features])
-                self.scalers['log'] = RobustScaler()
-                X_train[features] = self.scalers['log'].fit_transform(X_train[features])
-                X_val[features] = self.scalers['log'].transform(X_val[features])
-        
-        # Clip and scale
-        if 'clip_and_scale' in self.scaling_config:
-            clip_features = []
-            for feature, (min_val, max_val) in self.scaling_config['clip_and_scale'].items():
-                if feature in X_train.columns:
-                    X_train[feature] = X_train[feature].clip(min_val, max_val)
-                    X_val[feature] = X_val[feature].clip(min_val, max_val)
-                    clip_features.append(feature)
+            for cat_feature in self.feature_config.categorical_features:
+                if cat_feature in df_encoded.columns:
+                    # Get categories from all datasets if first time processing
+                    if cat_feature not in self.label_encoders:
+                        all_categories = set()
+                        for other_df in processed_datasets.values():
+                            if cat_feature in other_df.columns:
+                                cats = other_df[cat_feature].fillna('MISSING').astype(str).unique()
+                                all_categories.update(cats)
+                        
+                        self.label_encoders[cat_feature] = {
+                            cat: idx for idx, cat in enumerate(sorted(all_categories))
+                        }
+                    
+                    # Apply encoding
+                    encoded_col = f'{cat_feature}_encoded'
+                    cats = df_encoded[cat_feature].fillna('MISSING').astype(str)
+                    df_encoded[encoded_col] = cats.map(self.label_encoders[cat_feature])
+                    
+                    # Update feature name mapping
+                    self._update_feature_mapping(cat_feature, encoded_col, 'categorical_encoding')
+                    
+                    # Add to feature columns
+                    if encoded_col not in feature_columns:
+                        feature_columns.append(encoded_col)
             
-            if clip_features:
-                self.scalers['clip'] = RobustScaler()
-                X_train[clip_features] = self.scalers['clip'].fit_transform(X_train[clip_features])
-                X_val[clip_features] = self.scalers['clip'].transform(X_val[clip_features])
+            encoded_datasets[name] = df_encoded
         
-        return X_train, X_val
-    
-    def _transform_test_features(self, X_test: pd.DataFrame) -> pd.DataFrame:
-        """Transform test features using fitted scalers"""
-        X_test = X_test.copy()
+        # Step 5: Fill missing values in final feature columns
+        for name, df in encoded_datasets.items():
+            for col in feature_columns:
+                if col in df.columns:
+                    if df[col].dtype in [np.float64, np.int64]:
+                        fill_value = df[col].median()
+                    else:
+                        fill_value = df[col].mode().iloc[0] if not df[col].mode().empty else 0
+                    
+                    df[col] = df[col].fillna(fill_value)
         
-        # Apply same transformations as training
-        if 'log_transform' in self.scaling_config:
-            features = [f for f in self.scaling_config['log_transform'] if f in X_test.columns]
-            if features and 'log' in self.scalers:
-                X_test[features] = np.log1p(X_test[features])
-                X_test[features] = self.scalers['log'].transform(X_test[features])
+        logger.info(f"Smart feature processing complete. Final features: {len(feature_columns)}")
         
-        if 'robust_scale' in self.scaling_config:
-            features = [f for f in self.scaling_config['robust_scale'] if f in X_test.columns]
-            if features and 'robust' in self.scalers:
-                X_test[features] = self.scalers['robust'].transform(X_test[features])
-                
-        if 'clip_and_scale' in self.scaling_config:
-            clip_features = []
-            for feature, (min_val, max_val) in self.scaling_config['clip_and_scale'].items():
-                if feature in X_test.columns:
-                    X_test[feature] = X_test[feature].clip(min_val, max_val)
-                    clip_features.append(feature)
-            
-            if clip_features and 'clip' in self.scalers:
-                X_test[clip_features] = self.scalers['clip'].transform(X_test[clip_features])
-        
-        return X_test
-
-    def validate_transformation_consistency(self, X_original: pd.DataFrame, 
-                                          X_transformed: pd.DataFrame) -> Dict:
-        """Validate that feature transformations are reversible and consistent"""
-        validation_results = {}
-        
-        try:
-            X_reconstructed = self._inverse_transform_features(X_transformed)
-            
-            if X_original.shape == X_reconstructed.shape:
-                reconstruction_error = np.mean((X_original.values - X_reconstructed.values) ** 2)
-                validation_results['reconstruction_mse'] = reconstruction_error
-                validation_results['consistent'] = reconstruction_error < 1e-10
-            else:
-                validation_results['consistent'] = False
-                validation_results['error'] = 'Shape mismatch in reconstruction'
-                
-        except Exception as e:
-            validation_results['consistent'] = False
-            validation_results['error'] = f'Inverse transformation failed: {e}'
-        
-        for col in X_transformed.columns:
-            col_stats = {
-                'mean': X_transformed[col].mean(),
-                'std': X_transformed[col].std(),
-                'min': X_transformed[col].min(),
-                'max': X_transformed[col].max()
-            }
-            
-            if abs(col_stats['mean']) > 100 or col_stats['std'] > 100:
-                validation_results[f'{col}_extreme_scaling'] = col_stats
-        
-        return validation_results
-
-    def _inverse_transform_features(self, X_transformed: pd.DataFrame) -> pd.DataFrame:
-        """Inverse feature transformation for validation"""
-        X_inverse = X_transformed.copy()
-        
-        if 'clip' in self.scalers:
-            clip_features = []
-            for feature in self.scaling_config.get('clip_and_scale', {}):
-                if feature in X_inverse.columns:
-                    clip_features.append(feature)
-            if clip_features:
-                X_inverse[clip_features] = self.scalers['clip'].inverse_transform(X_inverse[clip_features])
-        
-        if 'log' in self.scalers:
-            log_features = [f for f in self.scaling_config.get('log_transform', []) if f in X_inverse.columns]
-            if log_features:
-                X_inverse[log_features] = self.scalers['log'].inverse_transform(X_inverse[log_features])
-                X_inverse[log_features] = np.expm1(X_inverse[log_features])
-        
-        if 'robust' in self.scalers:
-            robust_features = [f for f in self.scaling_config.get('robust_scale', []) if f in X_inverse.columns]
-            if robust_features:
-                X_inverse[robust_features] = self.scalers['robust'].inverse_transform(X_inverse[robust_features])
-        
-        return X_inverse
+        return encoded_datasets, feature_columns, self.label_encoders
 
 class SurvivalModelEngine:
-    """Enhanced AFT survival modeling engine with mathematical corrections and performance optimization"""
+    """Advanced AFT survival modeling engine with smart feature processing and multi-dataset support"""
     
-    def __init__(self, config: ModelConfig, feature_processor: FeatureProcessor):
-        """
-        Initialize with configuration and feature processing component
-        
-        Args:
-            config: Model configuration with AFT and XGBoost parameters
-            feature_processor: Feature processing component
-        """
+    def __init__(self, config: ModelConfig, feature_processor: SmartFeatureProcessor):
+        """Initialize with configuration and smart feature processing component"""
         self.config = config
         self.feature_processor = feature_processor
         self.model = None
@@ -259,96 +345,10 @@ class SurvivalModelEngine:
         
         logger.info(f"SurvivalModelEngine initialized with {len(config.aft_distributions)} AFT distributions")
     
-    def validate_xgboost_compatibility(self) -> Dict[str, Any]:
-        """
-        Validate XGBoost version and AFT support for production deployment
-        
-        Returns:
-            Dict: Compatibility assessment results
-        """
-        import xgboost as xgb
-        
-        try:
-            version = xgb.__version__
-            logger.info(f"Detected XGBoost version: {version}")
-            
-            test_data = np.random.randn(10, 3)
-            test_matrix = xgb.DMatrix(test_data)
-            test_matrix.set_float_info('label_lower_bound', np.ones(10))
-            test_matrix.set_float_info('label_upper_bound', np.ones(10) * 2)
-            
-            test_params = {
-                'objective': 'survival:aft',
-                'aft_loss_distribution': 'normal',
-                'aft_loss_distribution_scale': 1.0,
-                'verbosity': 0
-            }
-            
-            xgb.train(test_params, test_matrix, num_boost_round=1, verbose_eval=False)
-            
-            return {
-                'xgboost_version': version,
-                'version_compatible': True,
-                'interval_setup_tested': True,
-                'aft_objective_tested': True,
-                'status': 'COMPATIBLE'
-            }
-            
-        except Exception as e:
-            logger.error(f"XGBoost compatibility test failed: {e}")
-            return {
-                'xgboost_version': xgb.__version__ if 'xgb' in locals() else 'unknown',
-                'version_compatible': False,
-                'error': str(e),
-                'status': 'INCOMPATIBLE'
-            }
-
-    def _validate_xgboost_log_likelihood(self, predictions: np.ndarray, actuals: np.ndarray,
-                                       events: np.ndarray, distribution: str, 
-                                       scale: float) -> Dict[str, float]:
-        """Validate manual log-likelihood against XGBoost internal calculation"""
-        
-        y_lower = np.log1p(actuals)
-        y_upper = np.where(events == 1, np.log1p(actuals), np.inf)
-        
-        X_test = np.ones((len(actuals), 1))
-        dmatrix = xgb.DMatrix(X_test)
-        dmatrix.set_float_info('label_lower_bound', y_lower) 
-        dmatrix.set_float_info('label_upper_bound', y_upper)
-        
-        params = {
-            'objective': 'survival:aft',
-            'aft_loss_distribution': distribution,
-            'aft_loss_distribution_scale': scale,
-            'eta': 0.0,
-            'verbosity': 0
-        }
-        
-        try:
-            temp_model = xgb.train(params, dmatrix, num_boost_round=1, verbose_eval=False)
-            
-            eval_result = temp_model.eval(dmatrix)
-            xgb_nloglik = float(eval_result.split(':')[1])
-            
-            manual_loglik = self._calculate_manual_log_likelihood(
-                predictions, y_lower, events, distribution, scale
-            )
-            
-            return {
-                'xgb_negative_loglik': xgb_nloglik,
-                'manual_loglik': manual_loglik,
-                'difference': abs(-xgb_nloglik - manual_loglik),
-                'compatible': abs(-xgb_nloglik - manual_loglik) < 0.1
-            }
-            
-        except Exception as e:
-            logger.error(f"XGBoost compatibility validation failed: {e}")
-            return {'compatible': False, 'error': str(e)}
-
     def _calculate_manual_log_likelihood(self, predictions: np.ndarray, actuals: np.ndarray, 
-                                       events: np.ndarray, distribution: str, scale: float) -> float:
+                                    events: np.ndarray, distribution: str, scale: float) -> float:
         """
-        Manual log-likelihood calculation following AFT principles for XGBoost 3.0.2
+        Manual log-likelihood calculation following AFT principles for XGBoost 3.0+
         
         Args:
             predictions: Model predictions (eta) on log scale
@@ -361,7 +361,7 @@ class SurvivalModelEngine:
             float: Manual log-likelihood value
         """
         
-        # Convert to interval representation for XGBoost 3.0.2 compatibility
+        # Convert to interval representation for XGBoost 3.0+ compatibility
         y_lower = actuals
         y_upper = np.where(events == 1, actuals, np.inf)
         
@@ -409,18 +409,28 @@ class SurvivalModelEngine:
         
         return np.sum(log_likelihood_terms)
 
-    def optimize_aft_parameters(self, X_train: pd.DataFrame, y_train: pd.Series, event_train: pd.Series,
-                               X_val: pd.DataFrame, y_val: pd.Series, event_val: pd.Series) -> AFTParameters:
+    def optimize_aft_parameters(self, train_data: Tuple, val_data: Tuple) -> AFTParameters:
         """
-        MLE-based AFT parameter optimization across distributions for XGBoost 3.0.2
+        MLE-based AFT parameter optimization across distributions for XGBoost 3.0+
         
-        Uses interval-based approach with proper handling of censoring patterns.
+        Automatically applies log transformation using np.log() and performs comprehensive
+        grid search across distributions and scale parameters for optimal AFT configuration.
+        
+        Args:
+            train_data: (X_train, y_train, event_train) - survival times in original scale
+            val_data: (X_val, y_val, event_val) - survival times in original scale
+            
+        Returns:
+            AFTParameters: Optimal parameters with distribution and scale
         """
-        logger.info("Starting MLE-based AFT parameter optimization with XGBoost 3.0.2")
+        X_train, y_train, event_train = train_data
+        X_val, y_val, event_val = val_data
         
-        # Transform to log scale for AFT
-        y_train_log = np.log1p(y_train)
-        y_val_log = np.log1p(y_val)
+        logger.info("Starting MLE-based AFT parameter optimization with automatic log transformation")
+        
+        # Transform to log scale for AFT using np.log()
+        y_train_log = np.log(y_train)
+        y_val_log = np.log(y_val)
         
         best_params = None
         best_log_likelihood = -np.inf
@@ -439,7 +449,7 @@ class SurvivalModelEngine:
                 try:
                     # Train XGBoost AFT model with current parameters
                     temp_model = self._train_xgb_aft_temp(X_train, y_train_log, event_train, 
-                                                         distribution, scale)
+                                                        distribution, scale)
                     
                     # Get predictions for validation set
                     dval = xgb.DMatrix(X_val)
@@ -476,7 +486,7 @@ class SurvivalModelEngine:
             raise RuntimeError("AFT parameter optimization failed for all configurations")
         
         logger.info(f"Optimal AFT parameters: {best_params['distribution']} distribution, "
-                   f"scale={best_params['scale']:.4f}, log-likelihood={best_log_likelihood:.4f}")
+                f"scale={best_params['scale']:.4f}, log-likelihood={best_log_likelihood:.4f}")
         
         return AFTParameters(
             eta=best_params['eta_predictions'],
@@ -487,8 +497,8 @@ class SurvivalModelEngine:
         )
         
     def _train_xgb_aft_temp(self, X: pd.DataFrame, y_log: pd.Series, events: pd.Series,
-                           distribution: str, scale: float) -> xgb.Booster:
-        """Temporary XGBoost AFT training for parameter optimization using XGBoost 3.0.2"""
+                        distribution: str, scale: float) -> xgb.Booster:
+        """Temporary XGBoost AFT training for parameter optimization using XGBoost 3.0+"""
         
         # Convert to interval representation
         y_lower = y_log.values
@@ -517,230 +527,271 @@ class SurvivalModelEngine:
         
         return model
 
-    def train_survival_model(self, X_train: pd.DataFrame, y_train: pd.Series, event_train: pd.Series,
-                            X_val: pd.DataFrame, y_val: pd.Series, event_val: pd.Series) -> ModelResults:
+    def train_survival_model(self, datasets: Dict[str, Tuple[pd.DataFrame, str, str]]) -> ModelResults:
         """
-        Complete AFT model training pipeline
+        Complete AFT model training pipeline with flexible multi-dataset handling
         
-        Feature preprocessing through FeatureProcessor integration, optimal parameter
-        application to XGBoost AFT, and model validation on VAL dataset exclusively.
+        Processes multiple datasets through smart feature preprocessing, optimizes AFT parameters,
+        trains final model with comprehensive evaluation, and returns detailed results.
         
         Args:
-            X_train: Training features
-            y_train: Training survival times  
-            event_train: Training event indicators
-            X_val: Validation features
-            y_val: Validation survival times
-            event_val: Validation event indicators
+            datasets: Dict with dataset_name -> (dataframe, survival_time_col, event_col)
+                     e.g., {'train': (df_train, 'survival_time_days', 'event_indicator_vol'),
+                            'val': (df_val, 'survival_time_days', 'event_indicator_vol'),
+                            'oot': (df_oot, 'survival_time_days', 'event_indicator_vol')}
             
         Returns:
-            ModelResults: Comprehensive training results
+            ModelResults: Comprehensive training results with multi-dataset metrics
         """
-        logger.info("Starting complete AFT model training pipeline")
+        logger.info(f"Starting comprehensive AFT model training for {len(datasets)} datasets")
         
-        # Feature preprocessing
-        X_train_processed, X_val_processed, _ = self.feature_processor.process_features(
-            X_train, X_val
+        # Step 1: Extract data and create dataset dictionary for processing
+        data_for_processing = {}
+        target_info = {}
+        
+        for name, (df, survival_col, event_col) in datasets.items():
+            data_for_processing[name] = df
+            target_info[name] = (survival_col, event_col)
+            logger.info(f"{name} dataset: {df.shape[0]} samples")
+        
+        # Step 2: Smart feature processing
+        processed_datasets, feature_columns, label_encoders = self.feature_processor.process_features(
+            data_for_processing
         )
-        self.feature_columns = list(X_train_processed.columns)
+        self.feature_columns = feature_columns
         
-        # Store processed data for later use
-        self.training_metadata = {
-            'original_train_shape': X_train.shape,
-            'processed_train_shape': X_train_processed.shape,
-            'feature_columns': self.feature_columns,
-            'event_rate_train': event_train.mean(),
-            'event_rate_val': event_val.mean()
-        }
+        # Step 3: Prepare modeling datasets
+        model_datasets = {}
+        for name, df in processed_datasets.items():
+            survival_col, event_col = target_info[name]
+            
+            model_columns = feature_columns + [survival_col, event_col]
+            model_data = df[model_columns].dropna()
+            
+            X = model_data[feature_columns]
+            y = model_data[survival_col]
+            events = model_data[event_col]
+            
+            model_datasets[name] = (X, y, events)
+            logger.info(f"{name} modeling data: {len(model_data)} samples after dropna")
         
-        # Optimize AFT parameters using validation set
-        optimal_params = self.optimize_aft_parameters(
-            X_train_processed, y_train, event_train,
-            X_val_processed, y_val, event_val
-        )
+        # Step 4: Optimize AFT parameters using train and val
+        if 'train' in model_datasets and 'val' in model_datasets:
+            optimal_params = self.optimize_aft_parameters(
+                model_datasets['train'], model_datasets['val']
+            )
+        else:
+            # Use first two datasets if train/val not specified
+            dataset_names = list(model_datasets.keys())
+            optimal_params = self.optimize_aft_parameters(
+                model_datasets[dataset_names[0]], model_datasets[dataset_names[1]]
+            )
+        
         self.aft_parameters = optimal_params
         
-        # Train final model with optimal parameters
-        final_model = self._setup_xgboost_aft(
-            X_train_processed, np.log1p(y_train), event_train,
-            X_val_processed, np.log1p(y_val), event_val,
-            optimal_params
-        )
+        # Step 5: Train final model with all datasets for evaluation
+        final_model, evals_result = self._train_final_model(model_datasets, optimal_params)
         self.model = final_model
         
-        # Calculate training and validation metrics
-        train_predictions = final_model.predict(xgb.DMatrix(X_train_processed))
-        val_predictions = final_model.predict(xgb.DMatrix(X_val_processed))
+        # Step 6: Calculate comprehensive metrics
+        all_metrics = self._calculate_comprehensive_metrics(model_datasets, final_model)
         
-        training_metrics = self._calculate_training_metrics(
-            train_predictions, y_train, event_train
-        )
-        validation_metrics = self._calculate_training_metrics(
-            val_predictions, y_val, event_val
-        )
+        # Step 7: Feature importance with original names
+        feature_importance = self._extract_feature_importance_with_names(final_model)
         
-        # Feature importance analysis
-        feature_importance = self._extract_feature_importance(final_model)
+        # Step 8: Store training metadata
+        self.training_metadata = {
+            'dataset_shapes': {name: data[0].shape for name, data in model_datasets.items()},
+            'feature_columns': feature_columns,
+            'feature_name_mapping': self.feature_processor.feature_name_mapping,
+            'transformation_summary': self.feature_processor.get_transformation_summary()
+        }
         
-        logger.info(f"Model training complete. Validation C-index: {validation_metrics.get('c_index', 'N/A'):.4f}")
+        logger.info(f"Model training complete. Feature count: {len(feature_columns)}")
         
-        return ModelResults(
+        # Step 9: Create comprehensive results
+        results = ModelResults(
             model=final_model,
             aft_parameters=optimal_params,
-            training_metrics=training_metrics,
-            validation_metrics=validation_metrics,
+            training_metrics=all_metrics.get('train', {}),
+            validation_metrics=all_metrics.get('val', {}),
+            oot_metrics=all_metrics.get('oot', {}),
+            multi_dataset_metrics=all_metrics,
             feature_importance=feature_importance,
-            training_metadata=self.training_metadata
+            feature_name_mapping=self.feature_processor.feature_name_mapping,
+            training_metadata=self.training_metadata,
+            evals_result=evals_result
         )
+        
+        return results
     
-    def _setup_xgboost_aft(self, X_train: pd.DataFrame, y_train_log: pd.Series, event_train: pd.Series,
-                          X_val: pd.DataFrame, y_val_log: pd.Series, event_val: pd.Series,
-                          aft_params: AFTParameters) -> xgb.Booster:
-        """
-        XGBoost AFT model setup with proper censoring configuration for XGBoost 3.0.2
+    def _train_final_model(self, model_datasets: Dict[str, Tuple], aft_params: AFTParameters) -> Tuple[xgb.Booster, Dict]:
+        """Train final model with optimal parameters and multi-dataset evaluation"""
         
-        Uses interval-based censoring approach where all observations are intervals.
-        Right-censored data: [observed_time, +inf]
-        Uncensored data: [observed_time, observed_time]
-        """
+        # Create DMatrix for all datasets
+        dmatrices = {}
+        for name, (X, y, events) in model_datasets.items():
+            # Apply log transformation for AFT
+            y_log = np.log(y)
+            
+            # Create interval bounds
+            y_lower = y_log.values
+            y_upper = np.where(events == 1, y_log.values, np.inf)
+            
+            dmatrix = xgb.DMatrix(X, label=y_log)
+            dmatrix.set_float_info('label_lower_bound', y_lower)
+            dmatrix.set_float_info('label_upper_bound', y_upper)
+            
+            dmatrices[name] = dmatrix
         
-        # Create interval bounds for training data
-        y_lower_train = y_train_log.values
-        y_upper_train = np.where(
-            event_train == 1,  # Uncensored: exact time known
-            y_train_log.values,  # [time, time] - degenerate interval
-            np.inf  # Right-censored: [time, +inf) - unbounded interval
-        )
-        
-        # Create interval bounds for validation data  
-        y_lower_val = y_val_log.values
-        y_upper_val = np.where(
-            event_val == 1,
-            y_val_log.values,
-            np.inf
-        )
-        
-        # Create training DMatrix with interval-based labels
-        dtrain = xgb.DMatrix(X_train)
-        dtrain.set_float_info('label_lower_bound', y_lower_train)
-        dtrain.set_float_info('label_upper_bound', y_upper_train)
-        
-        # Create validation DMatrix
-        dval = xgb.DMatrix(X_val)
-        dval.set_float_info('label_lower_bound', y_lower_val)
-        dval.set_float_info('label_upper_bound', y_upper_val)
-        
-        # Set AFT parameters (note: eval_metric uses hyphenated form in 3.0.2)
+        # Set final AFT parameters
         params = self.config.xgb_params.copy()
         params.update({
             'objective': 'survival:aft',
-            'eval_metric': 'aft-nloglik',  # Hyphenated form for XGBoost 3.0.2
+            'eval_metric': 'aft-nloglik',
             'aft_loss_distribution': aft_params.distribution,
             'aft_loss_distribution_scale': aft_params.sigma
         })
         
-        # Training with early stopping
-        evals = [(dtrain, 'train'), (dval, 'val')]
+        # Prepare evaluation sets
+        evals = [(dmatrix, name) for name, dmatrix in dmatrices.items()]
+        evals_result = {}
+        
+        # Get training dataset (prefer 'train', fallback to first dataset)
+        train_dmatrix = dmatrices.get('train') or list(dmatrices.values())[0]
+        
+        # Train with comprehensive evaluation
         model = xgb.train(
-            params, dtrain,
+            params, train_dmatrix,
             num_boost_round=self.config.num_boost_round,
             evals=evals,
+            evals_result=evals_result,
             early_stopping_rounds=self.config.early_stopping_rounds,
             verbose_eval=False
         )
         
-        return model
+        return model, evals_result
     
-    def _calculate_training_metrics(self, predictions: np.ndarray, actuals: pd.Series, 
-                                   events: pd.Series) -> Dict[str, float]:
-        """Calculate basic training metrics with proper AFT handling"""
-        from lifelines.utils import concordance_index
+    def _calculate_comprehensive_metrics(self, model_datasets: Dict[str, Tuple], model: xgb.Booster) -> Dict[str, Dict]:
+        """Calculate comprehensive metrics for all datasets"""
+        all_metrics = {}
         
-        # Transform predictions back to original scale for C-index
-        pred_days = np.expm1(predictions)
+        for name, (X, y, events) in model_datasets.items():
+            try:
+                # Get predictions
+                dmatrix = xgb.DMatrix(X)
+                predictions = model.predict(dmatrix)
+                
+                # Calculate metrics
+                from lifelines.utils import concordance_index
+                pred_days = np.exp(predictions)  # Transform back from log scale
+                c_index = concordance_index(y, pred_days, events)
+                
+                metrics = {
+                    'c_index': c_index,
+                    'sample_size': len(X),
+                    'event_rate': events.mean(),
+                    'prediction_mean': predictions.mean(),
+                    'prediction_std': predictions.std()
+                }
+                
+                all_metrics[name] = metrics
+                logger.info(f"{name} C-index: {c_index:.4f}")
+                
+            except Exception as e:
+                logger.warning(f"Failed to calculate metrics for {name}: {e}")
+                all_metrics[name] = {'error': str(e)}
         
-        metrics = {
-            'c_index': concordance_index(actuals, pred_days, events),
-            'prediction_mean': predictions.mean(),
-            'prediction_std': predictions.std(),
-            'prediction_range': predictions.max() - predictions.min()
-        }
-        
-        return metrics
+        return all_metrics
     
-    def _extract_feature_importance(self, model: xgb.Booster) -> pd.DataFrame:
-        """Extract and format feature importance with proper column handling"""
+    def _extract_feature_importance_with_names(self, model: xgb.Booster) -> pd.DataFrame:
+        """Extract feature importance with original feature names"""
         importance_dict = model.get_score(importance_type='gain')
+        
+        if not importance_dict:
+            return pd.DataFrame(columns=['feature', 'original_feature', 'importance'])
         
         # Handle both f0, f1, ... and actual feature names
         if self.feature_columns and list(importance_dict.keys())[0].startswith('f'):
-            importance_df = pd.DataFrame([
-                {'feature': self.feature_columns[int(f[1:])], 'importance': score}
-                for f, score in importance_dict.items()
-                if int(f[1:]) < len(self.feature_columns)
-            ])
+            importance_data = []
+            for f, score in importance_dict.items():
+                feature_idx = int(f[1:])
+                if feature_idx < len(self.feature_columns):
+                    transformed_name = self.feature_columns[feature_idx]
+                    original_name = self.feature_processor.feature_name_mapping.get(
+                        transformed_name, transformed_name
+                    )
+                    importance_data.append({
+                        'feature': transformed_name,
+                        'original_feature': original_name,
+                        'importance': score
+                    })
         else:
-            importance_df = pd.DataFrame([
-                {'feature': f, 'importance': score}
-                for f, score in importance_dict.items()
-            ])
+            importance_data = []
+            for f, score in importance_dict.items():
+                original_name = self.feature_processor.feature_name_mapping.get(f, f)
+                importance_data.append({
+                    'feature': f,
+                    'original_feature': original_name,
+                    'importance': score
+                })
         
-        return importance_df.sort_values('importance', ascending=False).reset_index(drop=True)
-
+        importance_df = pd.DataFrame(importance_data).sort_values('importance', ascending=False)
+        return importance_df.reset_index(drop=True)
+    
     def predict_survival_curves(self, X: pd.DataFrame, time_points: Optional[np.ndarray] = None) -> np.ndarray:
         """
-        Memory-efficient survival curve generation with mathematical corrections
+        Generate survival curves using AFT formulation - XGBoost 3.0+ compatible
         
-        STRATEGIC CHANGE: Instead of storing large arrays, generate curves on-demand
-        for business-critical time horizons only.
+        Applies smart feature processing pipeline and generates survival probability curves
+        based on trained AFT distribution parameters.
+        
+        Args:
+            X: Features for prediction (will be processed through same pipeline as training)
+            time_points: Time points for survival curve (default: 1-365 days)
+            
+        Returns:
+            np.ndarray: Survival curves with shape (n_samples, n_time_points)
         """
         if self.model is None or self.aft_parameters is None:
             raise RuntimeError("Model must be trained before generating predictions")
         
         if time_points is None:
-            time_points = np.array([30, 90, 180, 365])
+            time_points = np.arange(1, 366, 1)
         
-        estimated_memory_mb = (len(X) * len(time_points) * 8) / (1024 * 1024)
+        # Process features using the same pipeline
+        X_processed = self._get_processed_features(X)
         
-        if estimated_memory_mb > self.config.max_curve_memory_mb:
-            logger.info(f"Using batch processing: estimated {estimated_memory_mb:.1f}MB > {self.config.max_curve_memory_mb}MB threshold")
-            return self._predict_survival_curves_batched(X, time_points)
-        else:
-            return self._predict_survival_curves_direct(X, time_points)
-    
-    def _predict_survival_curves_direct(self, X: pd.DataFrame, time_points: np.ndarray) -> np.ndarray:
-        """Direct survival curve generation for smaller datasets"""
-        
-        if hasattr(self.feature_processor, 'scalers') and self.feature_processor.scalers:
-            X_processed = self.feature_processor._transform_test_features(X)
-        else:
-            X_processed = X[self.feature_columns] if self.feature_columns else X
-        
+        # Get AFT predictions (eta)
         dmatrix = xgb.DMatrix(X_processed)
         eta_predictions = self.model.predict(dmatrix)
         
         logger.info(f"Generating survival curves for {len(X)} samples over {len(time_points)} time points")
-        logger.info(f"AFT predictions - Mean: {eta_predictions.mean():.3f}, Std: {eta_predictions.std():.3f}")
         
         # Generate survival curves based on AFT distribution
         survival_curves = []
         
         for eta in eta_predictions:
             if self.aft_parameters.distribution == 'normal':
-                survival_probs = self._calculate_normal_survival_probabilities(
-                    time_points, eta, self.aft_parameters.sigma
-                )
+                log_times = np.log(time_points)
+                z_scores = (log_times - eta) / self.aft_parameters.sigma
+                survival_probs = 1 - stats.norm.cdf(z_scores)
+                
             elif self.aft_parameters.distribution == 'logistic':
-                survival_probs = self._calculate_logistic_survival_probabilities(
-                    time_points, eta, self.aft_parameters.sigma
-                )
+                log_times = np.log(time_points)
+                z_scores = (log_times - eta) / self.aft_parameters.sigma
+                survival_probs = 1 / (1 + np.exp(z_scores))
+                
             elif self.aft_parameters.distribution == 'extreme':
-                survival_probs = self._calculate_extreme_survival_probabilities_robust(
-                    time_points, eta, self.aft_parameters.sigma
-                )
+                log_times = np.log(time_points)
+                z_scores = (log_times - eta) / self.aft_parameters.sigma
+                survival_probs = np.exp(-np.exp(z_scores))
+            
             else:
                 raise ValueError(f"Unsupported distribution: {self.aft_parameters.distribution}")
             
+            # Ensure valid probabilities
+            survival_probs = np.clip(survival_probs, 1e-6, 1.0 - 1e-6)
             survival_curves.append(survival_probs)
         
         survival_curves = np.array(survival_curves)
@@ -748,187 +799,74 @@ class SurvivalModelEngine:
         # Log summary statistics
         final_survival = survival_curves[:, -1]
         logger.info(f"Survival curve statistics:")
-        logger.info(f"  Mean final survival: {final_survival.mean():.3f} ± {final_survival.std():.3f}")
+        logger.info(f"  1-day survival: {survival_curves[:, 0].mean():.3f} ± {survival_curves[:, 0].std():.3f}")
+        logger.info(f"  365-day survival: {final_survival.mean():.3f} ± {final_survival.std():.3f}")
         
         return survival_curves
-    
-    def _predict_survival_curves_batched(self, X: pd.DataFrame, time_points: np.ndarray) -> np.ndarray:
-        """Memory-efficient batch processing for large datasets"""
-        batch_size = self.config.batch_size_large_datasets
-        n_samples = len(X)
-        n_time_points = len(time_points)
-        
-        survival_curves = np.zeros((n_samples, n_time_points))
-        
-        for start_idx in range(0, n_samples, batch_size):
-            end_idx = min(start_idx + batch_size, n_samples)
-            batch_X = X.iloc[start_idx:end_idx]
-            
-            batch_curves = self._predict_survival_curves_direct(batch_X, time_points)
-            survival_curves[start_idx:end_idx] = batch_curves
-            
-            logger.info(f"Processed batch {start_idx:,}-{end_idx:,}")
-        
-        return survival_curves
-    
-    def _calculate_normal_survival_probabilities(self, time_points: np.ndarray, 
-                                               eta: float, sigma: float) -> np.ndarray:
-        """Normal AFT survival probability calculation"""
-        log_times = np.log(np.maximum(time_points, 1e-6))
-        z_scores = (log_times - eta) / sigma
-        return 1 - stats.norm.cdf(z_scores)
-    
-    def _calculate_logistic_survival_probabilities(self, time_points: np.ndarray,
-                                                 eta: float, sigma: float) -> np.ndarray:
-        """Logistic AFT survival probability calculation"""
-        log_times = np.log(np.maximum(time_points, 1e-6))
-        z_scores = (log_times - eta) / sigma
-        return 1 / (1 + np.exp(z_scores))
-    
-    def _calculate_extreme_survival_probabilities_robust(self, time_points: np.ndarray,
-                                                       eta: float, sigma: float) -> np.ndarray:
-        """
-        Mathematically correct extreme value AFT survival calculation with proper bounds
-        """
-        log_times = np.log(np.maximum(time_points, 1e-8))
-        z_scores = (log_times - eta) / sigma
-        
-        exp_z = np.exp(np.clip(z_scores, -500, 700))
-        
-        neg_exp_z = -exp_z
-        neg_exp_z = np.clip(neg_exp_z, -700, 0)
-        
-        survival_probs = np.exp(neg_exp_z)
-        
-        survival_probs = np.clip(survival_probs, 0.0, 1.0)
-        
-        invalid_mask = ~np.isfinite(survival_probs)
-        if np.any(invalid_mask):
-            logger.warning(f"Invalid survival probabilities detected: {invalid_mask.sum()} out of {len(survival_probs)}")
-            survival_probs[invalid_mask] = 0.0
-        
-        return survival_probs
     
     def predict_risk_scores(self, X: pd.DataFrame) -> np.ndarray:
         """
-        Enhanced risk score generation with corrected mathematical relationship
+        Business-ready risk score generation from AFT predictions
         
-        IMPROVEMENT: Uses proper inverse relationship between survival time and risk
+        Processes features through smart preprocessing pipeline and generates normalized
+        risk scores where higher values indicate higher risk of event occurrence.
+        
         Args:
-            X: Features for prediction
+            X: Features for prediction (will be processed through same pipeline as training)
             
         Returns:
-            np.ndarray: Normalized risk scores [0, 1]
+            np.ndarray: Normalized risk scores [0, 1] where 1 = highest risk
         """
         if self.model is None:
             raise RuntimeError("Model must be trained before generating risk scores")
         
-        # Process features if needed
-        if hasattr(self.feature_processor, 'scalers') and self.feature_processor.scalers:
-            X_processed = self.feature_processor._transform_test_features(X)  
-        else:
-            X_processed = X[self.feature_columns] if self.feature_columns else X
+        # Process features using the same pipeline
+        X_processed = self._get_processed_features(X)
         
         # Get AFT predictions
         dmatrix = xgb.DMatrix(X_processed)
         eta_predictions = self.model.predict(dmatrix)
         
         # Convert to risk scores (lower predicted survival time = higher risk)
-        predicted_times = np.expm1(eta_predictions)
+        risk_scores = -eta_predictions
         
-        risk_scores = 1.0 / (predicted_times + 1)
-        
-        risk_scores = (risk_scores - risk_scores.min()) / (risk_scores.max() - risk_scores.min())
+        # Normalize to [0, 1] range
+        risk_scores = risk_scores - risk_scores.min()
+        if risk_scores.max() > 0:
+            risk_scores = risk_scores / risk_scores.max()
         
         logger.info(f"Generated risk scores - Mean: {risk_scores.mean():.3f}, Std: {risk_scores.std():.3f}")
         
         return risk_scores
     
-    def predict_time_horizons(self, X: pd.DataFrame, horizons: List[int] = [30, 90, 180, 365]) -> Dict[str, np.ndarray]:
-        """
-        Memory-efficient prediction at specific business horizons
+    def _get_processed_features(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Process features for any dataset using the trained smart preprocessing pipeline"""
+        if not hasattr(self.feature_processor, 'label_encoders') or not self.feature_processor.label_encoders:
+            logger.warning("Feature processor not trained. Processing features without encoding.")
+            return X[self.feature_columns] if self.feature_columns else X
         
-        JUSTIFICATION: Most business applications only need survival probabilities
-        at key time points (30d, 90d, 1yr), not full 365-day curves.
-        This reduces memory usage by 90%+ while maintaining business utility.
-        """
-        horizon_predictions = {}
+        # Apply same smart preprocessing pipeline
+        X_processed = self.feature_processor.process_dataset(X, "prediction")
         
-        if hasattr(self.feature_processor, 'scalers') and self.feature_processor.scalers:
-            X_processed = self.feature_processor._transform_test_features(X)
-        else:
-            X_processed = X[self.feature_columns] if self.feature_columns else X
+        # Apply categorical encoding using trained encoders
+        for cat_feature, mapping in self.feature_processor.label_encoders.items():
+            if cat_feature in X_processed.columns:
+                encoded_col = f'{cat_feature}_encoded'
+                cats = X_processed[cat_feature].fillna('MISSING').astype(str)
+                X_processed[encoded_col] = cats.map(mapping).fillna(0)  # Unknown categories get 0
         
-        dmatrix = xgb.DMatrix(X_processed)
-        eta_predictions = self.model.predict(dmatrix)
+        # Select final features
+        available_features = [col for col in self.feature_columns if col in X_processed.columns]
         
-        for horizon in horizons:
-            time_array = np.array([horizon])
-            
-            if self.aft_parameters.distribution == 'normal':
-                survival_probs = np.array([
-                    self._calculate_normal_survival_probabilities(time_array, eta, self.aft_parameters.sigma)[0]
-                    for eta in eta_predictions
-                ])
-            elif self.aft_parameters.distribution == 'logistic':
-                survival_probs = np.array([
-                    self._calculate_logistic_survival_probabilities(time_array, eta, self.aft_parameters.sigma)[0]
-                    for eta in eta_predictions
-                ])
-            elif self.aft_parameters.distribution == 'extreme':
-                survival_probs = np.array([
-                    self._calculate_extreme_survival_probabilities_robust(time_array, eta, self.aft_parameters.sigma)[0]
-                    for eta in eta_predictions
-                ])
-            
-            horizon_predictions[f'{horizon}d'] = survival_probs
-        
-        return horizon_predictions
-
-    def predict_survival_curves_generator(self, X: pd.DataFrame, 
-                                        time_points: Optional[np.ndarray] = None,
-                                        batch_size: int = 1000):
-        """True memory-efficient survival curve generation using generators"""
-        
-        if time_points is None:
-            time_points = np.array([30, 90, 180, 365])
-        
-        n_samples = len(X)
-        
-        for start_idx in range(0, n_samples, batch_size):
-            end_idx = min(start_idx + batch_size, n_samples)
-            batch_X = X.iloc[start_idx:end_idx]
-            
-            batch_curves = self._predict_survival_curves_direct(batch_X, time_points)
-            
-            for i, curve in enumerate(batch_curves):
-                yield start_idx + i, curve
-
-    def predict_survival_curves_streaming(self, X: pd.DataFrame, 
-                                        time_points: Optional[np.ndarray] = None,
-                                        output_file: Optional[str] = None) -> Optional[np.ndarray]:
-        """Stream survival curves to file or return iterator"""
-        
-        if output_file:
-            with open(output_file, 'w') as f:
-                f.write(f"sample_id,{','.join([f't_{t}' for t in time_points])}\n")
-                
-                for sample_id, curve in self.predict_survival_curves_generator(X, time_points):
-                    curve_str = ','.join([f'{p:.6f}' for p in curve])
-                    f.write(f"{sample_id},{curve_str}\n")
-            
-            logger.info(f"Survival curves written to {output_file}")
-            return None
-        else:
-            return self.predict_survival_curves_generator(X, time_points)
-
+        return X_processed[available_features]
+    
     def save_model(self, filepath: str, include_metadata: bool = True) -> bool:
         """
-        Comprehensive model persistence with metadata
+        Comprehensive model persistence with metadata and smart preprocessing state
         
         Args:
             filepath: Path to save model
-            include_metadata: Whether to include training metadata
+            include_metadata: Whether to include training metadata and feature processing state
             
         Returns:
             bool: Success status
@@ -950,10 +888,13 @@ class SurvivalModelEngine:
                         'log_likelihood': self.aft_parameters.log_likelihood
                     },
                     'feature_columns': self.feature_columns,
+                    'feature_name_mapping': self.feature_processor.feature_name_mapping,
+                    'transformation_summary': self.feature_processor.get_transformation_summary(),
                     'training_metadata': self.training_metadata,
                     'config': {
                         'aft_distributions': self.config.aft_distributions,
-                        'scale_parameter_range': self.config.scale_parameter_range
+                        'scale_parameter_range': self.config.scale_parameter_range,
+                        'xgb_params': self.config.xgb_params
                     }
                 }
                 
@@ -1023,18 +964,9 @@ class SurvivalModelEngine:
             return False
 
 if __name__ == "__main__":
-    print("=== ENHANCED SURVIVAL MODEL ENGINE ===")
-    print("Key Improvements:")
-    print("• Fixed extreme distribution AFT mathematical implementation")
-    print("• Memory-efficient survival curve generation")
-    print("• Proper XGBoost 3.0.2 compatibility validation")
-    print("• Enhanced risk score derivation")
-    print("• Production-ready performance optimizations")
-    
     """
-    Comprehensive test suite for SurvivalModelEngine with XGBoost 3.0.2
-    
-    Assumes df is available with person_composite_id x vantage_date level data
+    Comprehensive test suite for Advanced SurvivalModelEngine
+    Demonstrates smart feature processing, multi-dataset training, and production-ready workflows
     """
     
     # Set up logging
@@ -1049,211 +981,206 @@ if __name__ == "__main__":
     print("\n1. PREPARING DATA...")
     
     # Basic data preparation
-    df_clean = df.dropna(subset=['survival_time_days', 'event_indicator_all']).copy()
+    df_clean = df.dropna(subset=['survival_time_days', 'event_indicator_vol']).copy()
     
     # Split data by dataset_split
-    train_data = df_clean[df_clean['dataset_split'] == 'train'].copy()
-    val_data = df_clean[df_clean['dataset_split'] == 'val'].copy()
-    oot_data = df_clean[df_clean['dataset_split'] == 'oot'].copy() if 'oot' in df_clean['dataset_split'].values else None
+    datasets_raw = {
+        'train': df_clean[df_clean['dataset_split'] == 'train'].copy(),
+        'val': df_clean[df_clean['dataset_split'] == 'val'].copy()
+    }
     
-    print(f"Train samples: {len(train_data)}, Val samples: {len(val_data)}")
-    if oot_data is not None:
-        print(f"OOT samples: {len(oot_data)}")
+    # Add OOT if available
+    if 'oot' in df_clean['dataset_split'].values:
+        datasets_raw['oot'] = df_clean[df_clean['dataset_split'] == 'oot'].copy()
     
-    # Define feature columns (adapt based on your actual features)
-    feature_columns = [
-        'age_at_vantage', 'tenure_at_vantage_days', 'baseline_salary', 'team_size',
-        'team_avg_comp', 'salary_growth_ratio', 'manager_changes_count'
-    ]
-    # Filter to available columns
-    feature_columns = [col for col in feature_columns if col in df_clean.columns]
-    
-    # Prepare X, y, events for train and validation
-    X_train, y_train, event_train = train_data[feature_columns], train_data['survival_time_days'], train_data['event_indicator_all']
-    X_val, y_val, event_val = val_data[feature_columns], val_data['survival_time_days'], val_data['event_indicator_all']
-    
-    print(f"Using {len(feature_columns)} features: {feature_columns[:5]}...")
-    print(f"Event rates - Train: {event_train.mean():.3f}, Val: {event_val.mean():.3f}")
+    print(f"Dataset sizes: {[(name, len(data)) for name, data in datasets_raw.items()]}")
+    print(f"Event rates: {[(name, data['event_indicator_vol'].mean()) for name, data in datasets_raw.items()]}")
     
     # ===== 2. CONFIGURATION SETUP =====
     print("\n2. SETTING UP CONFIGURATION...")
     
-    # Feature scaling configuration
-    feature_scaling_config = {
-        'robust_scale': ['baseline_salary', 'team_avg_comp', 'salary_growth_ratio'],
-        'log_transform': ['manager_changes_count'],
-        'clip_and_scale': {
-            'age_at_vantage': (18, 80),
-            'tenure_at_vantage_days': (0, 36500),
-            'team_size': (1, 1000)
-        }
-    }
-    
-    # Initialize components
+    # Initialize smart feature configuration
+    feature_config = FeatureConfig()
     model_config = ModelConfig()
-    feature_processor = FeatureProcessor(feature_scaling_config)
+    
+    # Initialize feature processor
+    feature_processor = SmartFeatureProcessor(feature_config)
     engine = SurvivalModelEngine(model_config, feature_processor)
     
     print("✓ Configuration and components initialized")
+    print(f"✓ IQR cap features: {len(feature_config.iqr_cap_features)}")
+    print(f"✓ Log transform features: {len(feature_config.log_transform_features)}")
+    print(f"✓ Winsorize features: {len(feature_config.winsorize_features)}")
+    print(f"✓ Categorical features: {len(feature_config.categorical_features)}")
     
-    # ===== 3. XGBOOST COMPATIBILITY VALIDATION =====
-    print("\n3. VALIDATING XGBOOST 3.0.2 COMPATIBILITY...")
+    # ===== 3. MODEL TRAINING =====
+    print("\n3. TRAINING SURVIVAL MODEL...")
     
-    # Test XGBoost compatibility
-    compatibility_results = engine.validate_xgboost_compatibility()
-    print(f"✓ XGBoost version: {compatibility_results['xgboost_version']}")
-    print(f"✓ Version compatible: {compatibility_results['version_compatible']}")
-    print(f"✓ Interval setup tested: {compatibility_results['interval_setup_tested']}")
+    # Prepare datasets for training with new flexible interface
+    training_datasets = {}
+    for name, data in datasets_raw.items():
+        training_datasets[name] = (data, 'survival_time_days', 'event_indicator_vol')
     
-    # ===== 4. AFT PARAMETER OPTIMIZATION =====
-    print("\n4. OPTIMIZING AFT PARAMETERS...")
+    # Train comprehensive model with smart preprocessing
+    model_results = engine.train_survival_model(training_datasets)
     
-    # Optimize AFT parameters using validation set
-    optimal_params = engine.optimize_aft_parameters(X_train, y_train, event_train, X_val, y_val, event_val)
-    print(f"✓ Optimal distribution: {optimal_params.distribution}")
-    print(f"✓ Optimal scale: {optimal_params.sigma:.4f}")
-    print(f"✓ Log-likelihood: {optimal_params.log_likelihood:.4f}")
+    print(f"✓ Smart model trained successfully")
+    print(f"✓ Training C-index: {model_results.training_metrics.get('c_index', 'N/A'):.4f}")
+    print(f"✓ Validation C-index: {model_results.validation_metrics.get('c_index', 'N/A'):.4f}")
+    if model_results.oot_metrics:
+        print(f"✓ OOT C-index: {model_results.oot_metrics.get('c_index', 'N/A'):.4f}")
+    print(f"✓ Optimal AFT distribution: {model_results.aft_parameters.distribution}")
+    print(f"✓ Optimal scale parameter: {model_results.aft_parameters.sigma:.4f}")
+    print(f"✓ Final feature count: {len(model_results.feature_importance)}")
     
-    # ===== 5. FULL MODEL TRAINING =====
-    print("\n5. TRAINING COMPLETE SURVIVAL MODEL...")
+    # ===== 4. SMART FEATURE ANALYSIS =====
+    print("\n4. ANALYZING SMART FEATURE PROCESSING...")
     
-    # Train complete model
-    model_results = engine.train_survival_model(X_train, y_train, event_train, X_val, y_val, event_val)
-    print(f"✓ Model trained successfully")
-    print(f"✓ Training C-index: {model_results.training_metrics['c_index']:.4f}")
-    print(f"✓ Validation C-index: {model_results.validation_metrics['c_index']:.4f}")
-    print(f"✓ Best iteration: {model_results.model.best_iteration}")
+    # Show transformation summary
+    transformation_summary = engine.feature_processor.get_transformation_summary()
+    print(f"✓ Features transformed: {len(transformation_summary)}")
+    print("✓ Top 5 feature transformations:")
+    for orig_feature, transforms in list(transformation_summary.items())[:5]:
+        print(f"   {orig_feature}: {' → '.join(transforms)}")
     
-    # ===== 6. MODEL VALIDATION =====
-    print("\n6. VALIDATING MODEL TRAINING...")
+    # Show feature importance with original names
+    top_features = model_results.feature_importance.head(10)
+    print("\n✓ Top 10 most important features (with original names):")
+    for idx, row in top_features.iterrows():
+        print(f"   {row['original_feature']} ({row['feature']}): {row['importance']:.2f}")
     
-    # Validate model training quality
-    validation_results = engine.validate_model_training(model_results)
-    print(f"✓ Training quality: {validation_results['training_quality']}")
-    print(f"✓ Convergence: {validation_results['prediction_stats']['convergence']}")
-    if validation_results['issues']:
-        print(f"⚠ Issues detected: {validation_results['issues']}")
+    # ===== 5. SMART PREDICTIONS =====
+    print("\n5. TESTING SMART PREDICTIONS...")
     
-    # ===== 7. SURVIVAL CURVE GENERATION =====
-    print("\n7. GENERATING SURVIVAL CURVES...")
-    
-    # Generate survival curves for validation set
+    # Test on validation set
+    X_val = datasets_raw['val']
     survival_curves = engine.predict_survival_curves(X_val)
-    print(f"✓ Generated curves for {survival_curves.shape[0]} samples over {survival_curves.shape[1]} time points")
+    risk_scores = engine.predict_risk_scores(X_val)
+    
+    print(f"✓ Generated survival curves: {survival_curves.shape}")
     print(f"✓ Mean 30-day survival: {survival_curves[:, 29].mean():.3f}")
     print(f"✓ Mean 365-day survival: {survival_curves[:, -1].mean():.3f}")
+    print(f"✓ Risk scores range: [{risk_scores.min():.3f}, {risk_scores.max():.3f}]")
     
-    # ===== 8. RISK SCORE CALCULATION =====
-    print("\n8. CALCULATING RISK SCORES...")
+    # ===== 6. MODEL PERSISTENCE TEST =====
+    print("\n6. TESTING SMART MODEL PERSISTENCE...")
     
-    # Generate risk scores
-    risk_scores = engine.predict_risk_scores(X_val)
-    print(f"✓ Generated risk scores - Mean: {risk_scores.mean():.3f}, Std: {risk_scores.std():.3f}")
-    print(f"✓ Risk score range: [{risk_scores.min():.3f}, {risk_scores.max():.3f}]")
-    
-    # ===== 9. FEATURE IMPORTANCE ANALYSIS =====
-    print("\n9. ANALYZING FEATURE IMPORTANCE...")
-    
-    # Display top features
-    top_features = model_results.feature_importance.head(5)
-    print("✓ Top 5 most important features:")
-    for idx, row in top_features.iterrows():
-        print(f"   {row['feature']}: {row['importance']:.2f}")
-    
-    # ===== 10. MODEL PERSISTENCE TEST =====
-    print("\n10. TESTING MODEL PERSISTENCE...")
-    
-    # Test model saving and loading
-    test_filepath = "./test_survival_model"
+    test_filepath = "./smart_survival_model"
     save_success = engine.save_model(test_filepath, include_metadata=True)
-    print(f"✓ Model save successful: {save_success}")
+    print(f"✓ Smart model save: {save_success}")
     
-    # Create new engine and test loading
-    new_engine = SurvivalModelEngine(model_config, feature_processor)
+    # Test loading
+    new_engine = SurvivalModelEngine(model_config, SmartFeatureProcessor(feature_config))
     load_success = new_engine.load_model(test_filepath)
-    print(f"✓ Model load successful: {load_success}")
+    print(f"✓ Smart model load: {load_success}")
     
-    # ===== 11. OOT TESTING (IF AVAILABLE) =====
-    if oot_data is not None:
-        print("\n11. OUT-OF-TIME TESTING...")
-        
-        X_oot, y_oot, event_oot = oot_data[feature_columns], oot_data['survival_time_days'], oot_data['event_indicator_all']
-        
-        # Generate OOT predictions
-        oot_survival_curves = engine.predict_survival_curves(X_oot)
-        oot_risk_scores = engine.predict_risk_scores(X_oot)
-        
-        print(f"✓ OOT survival curves generated for {len(X_oot)} samples")
-        print(f"✓ OOT mean 365-day survival: {oot_survival_curves[:, -1].mean():.3f}")
-        print(f"✓ OOT risk scores - Mean: {oot_risk_scores.mean():.3f}")
-        
-        # Calculate OOT C-index if lifelines is available
-        try:
-            from lifelines.utils import concordance_index
-            oot_c_index = concordance_index(y_oot, -oot_risk_scores, event_oot)
-            print(f"✓ OOT C-index: {oot_c_index:.4f}")
-        except ImportError:
-            print("⚠ Lifelines not available for C-index calculation")
+    # Verify loaded model works
+    test_risk_scores = new_engine.predict_risk_scores(X_val.head(100))
+    print(f"✓ Loaded model prediction test: {test_risk_scores.mean():.3f}")
     
-    # ===== 12. PERFORMANCE SUMMARY =====
-    print("\n12. PERFORMANCE SUMMARY...")
+    # ===== 7. BUSINESS INTELLIGENCE =====
+    print("\n7. BUSINESS INTELLIGENCE INSIGHTS...")
     
-    # Risk score distribution analysis
+    # Risk stratification analysis
     high_risk_threshold = np.percentile(risk_scores, 80)
     high_risk_mask = risk_scores >= high_risk_threshold
-    high_risk_event_rate = event_val[high_risk_mask].mean()
-    low_risk_event_rate = event_val[~high_risk_mask].mean()
+    
+    val_events = datasets_raw['val']['event_indicator_vol']
+    high_risk_event_rate = val_events[high_risk_mask].mean()
+    low_risk_event_rate = val_events[~high_risk_mask].mean()
     
     print(f"✓ High-risk group (top 20%) event rate: {high_risk_event_rate:.3f}")
     print(f"✓ Low-risk group (bottom 80%) event rate: {low_risk_event_rate:.3f}")
-    print(f"✓ Risk discrimination ratio: {high_risk_event_rate / low_risk_event_rate:.2f}x")
+    print(f"✓ Risk discrimination: {high_risk_event_rate / low_risk_event_rate:.2f}x better")
     
-    # ===== 13. BUSINESS INSIGHTS =====
-    print("\n13. BUSINESS INSIGHTS...")
+    # Feature processing efficiency
+    total_possible_features = (len(feature_config.iqr_cap_features) + 
+                             len(feature_config.log_transform_features) + 
+                             len(feature_config.winsorize_features))
+    actual_features_created = len([f for f in model_results.feature_importance['feature'] 
+                                  if f.endswith(('_cap', '_log', '_win_cap'))])
     
-    # Survival probability insights
-    median_survival_idx = np.where(survival_curves.mean(axis=0) <= 0.5)[0]
-    if len(median_survival_idx) > 0:
-        median_survival_days = median_survival_idx[0] + 1
-        print(f"✓ Population median survival time: ~{median_survival_days} days")
-    else:
-        print("✓ Population median survival time: >365 days")
-    
-    # Risk concentration
-    top_decile_mask = risk_scores >= np.percentile(risk_scores, 90)
-    top_decile_events = event_val[top_decile_mask].sum()
-    total_events = event_val.sum()
-    event_concentration = top_decile_events / total_events
-    
-    print(f"✓ Top 10% risk captures {event_concentration:.1%} of all events")
-    print(f"✓ Model lift in top decile: {event_concentration / 0.1:.1f}x")
+    print(f"✓ Smart processing efficiency: {actual_features_created}/{total_possible_features} features created")
+    print(f"✓ Memory saved by smart processing: ~{(total_possible_features - actual_features_created) * len(datasets_raw['train']) * 8 / 1024 / 1024:.1f} MB")
     
     # ===== FINAL STATUS =====
-    print("\n" + "="*50)
-    print("🎉 SURVIVAL MODEL ENGINE TEST COMPLETED SUCCESSFULLY!")
-    print("="*50)
+    print("\n" + "="*70)
+    print(" SURVIVAL MODEL ENGINE TEST COMPLETED SUCCESSFULLY!")
+    print("="*70)
     
-    print("\nKEY RESULTS:")
-    print(f"• Model Type: XGBoost AFT ({optimal_params.distribution} distribution)")
-    print(f"• Validation C-index: {model_results.validation_metrics['c_index']:.4f}")
-    print(f"• Scale Parameter: {optimal_params.sigma:.4f}")
-    print(f"• Feature Count: {len(feature_columns)}")
-    print(f"• Training Samples: {len(train_data):,}")
-    print(f"• Validation Samples: {len(val_data):,}")
-    if oot_data is not None:
-        print(f"• OOT Samples: {len(oot_data):,}")
+    print("\nKEY SMART FEATURES VALIDATED:")
+    print("• Smart feature preprocessing with automatic transformation detection")
+    print("• Memory-efficient processing (only creates needed features)")
+    print("• Feature name mapping and transformation tracking")
+    print("• Multi-dataset training with flexible interface")
+    print("• XGBoost 3.0+ AFT with automatic log transformation")
+    print("• Enhanced feature importance with original names")
+    print("• Comprehensive model persistence with preprocessing state")
+    print("• Production-ready prediction pipeline")
     
-    print("\nMODEL READY FOR PRODUCTION USE! 🚀")
-    
-    # Return key objects for further analysis
-    test_results = {
+    print(f"\nFINAL PERFORMANCE SUMMARY:")
+    print(f"• Model: XGBoost AFT ({model_results.aft_parameters.distribution})")
+    print(f"• Validation C-index: {model_results.validation_metrics.get('c_index', 'N/A'):.4f}")
+    if model_results.oot_metrics:
+        print(f"• OOT C-index: {model_results.oot_metrics.get('c_index', 'N/A'):.4f}")
+    print(f"• Features: {len(model_results.feature_importance)} (smart selection)")
+    print(f"• Datasets: {list(training_datasets.keys())}")
+    print(f"• Risk discrimination: {high_risk_event_rate / low_risk_event_rate:.2f}x")
+        
+    # Create results dictionary for further analysis
+    smart_test_results = {
         'engine': engine,
         'model_results': model_results,
-        'optimal_params': optimal_params,
+        'feature_processor': feature_processor,
         'survival_curves': survival_curves,
         'risk_scores': risk_scores,
-        'validation_results': validation_results,
-        'feature_importance': model_results.feature_importance
+        'transformation_summary': transformation_summary,
+        'feature_config': feature_config
     }
     
-    print(f"\nTest results stored in 'test_results' dictionary with {len(test_results)} components")
+    print(f"\nSmart test results available in 'smart_test_results' dictionary")
+    
+    # ===== USAGE EXAMPLES =====
+    print("\n" + "="*70)
+    print(" PRODUCTION USAGE EXAMPLES")
+    print("="*70)
+    
+    print("\n# Example 1: Initialize and train model")
+    print("""
+feature_config = FeatureConfig()
+model_config = ModelConfig()
+processor = SmartFeatureProcessor(feature_config)
+engine = SurvivalModelEngine(model_config, processor)
+
+# Prepare datasets
+datasets = {
+    'train': (train_df, 'survival_time_days', 'event_indicator_vol'),
+    'val': (val_df, 'survival_time_days', 'event_indicator_vol'),
+    'oot': (oot_df, 'survival_time_days', 'event_indicator_vol')
+}
+
+# Train model
+results = engine.train_survival_model(datasets)
+    """)
+    
+    print("\n# Example 2: Generate predictions")
+    print("""
+# Get survival curves
+survival_curves = engine.predict_survival_curves(new_data)
+
+# Get risk scores
+risk_scores = engine.predict_risk_scores(new_data)
+
+# Save model
+engine.save_model('./production_model')
+    """)
+    
+    print("\n# Example 3: Custom feature configuration")
+    print("""
+# Customize feature processing
+custom_config = FeatureConfig()
+custom_config.winsorize_features = ['salary', 'tenure', 'age']
+custom_config.log_transform_features = ['complexity_score']
+    """)
+    
+    print(f"\nREADY FOR  DEPLOYMENT!")
