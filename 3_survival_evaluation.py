@@ -479,7 +479,7 @@ class SurvivalEvaluation:
             censor_surv_probs = []
             for eval_time in eval_times:
                 if eval_time > 0:
-                    surv_prob = kmf_censor.survival_function_at_times([eval_time]).iloc[0, 0]
+                    surv_prob = kmf_censor.survival_function_at_times([eval_time]).iloc[0]
                     censor_surv_probs.append(max(surv_prob, 0.01))
                 else:
                     censor_surv_probs.append(1.0)
@@ -511,21 +511,14 @@ class SurvivalEvaluation:
         valid_outcomes = binary_outcomes[valid_mask]
         valid_weights = calibration_weights[valid_mask]
         
-        # Calculate calibration curve using sklearn with uniform binning
-        from sklearn.calibration import calibration_curve
-        
-        fraction_positives, mean_predicted = calibration_curve(
-            valid_outcomes,
-            valid_predictions,
-            n_bins=self.config.calibration_bins,
-            sample_weight=valid_weights,
-            strategy='uniform'
-        )
-        
-        # Calculate ECE manually with proper weight handling
+        # EXPERT FIX: Manual weighted calibration calculation (sklearn compatibility)
+        # Remove sklearn's sample_weight dependency and implement weighted binning manually
         n_bins = self.config.calibration_bins
         bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
         
+        # Calculate weighted calibration curve manually
+        fraction_positives = []
+        mean_predicted = []
         ece_sum = 0.0
         total_weight = 0.0
         
