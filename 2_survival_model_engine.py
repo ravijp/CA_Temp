@@ -227,6 +227,64 @@ class SmartFeatureProcessor:
         """Get summary of all transformations applied"""
         return {orig: [step['transformation'] for step in steps] 
                 for orig, steps in self.transformation_history.items()}
+        
+    def _transform_test_features(self, X_test: pd.DataFrame) -> pd.DataFrame:
+        """
+        Transform test/inference features using the same smart preprocessing pipeline
+        
+        This method applies the exact same transformations that were applied during training,
+        using the stored transformation state and encoders.
+        
+        Args:
+            X_test: Raw test features (same format as original training data)
+            
+        Returns:
+            pd.DataFrame: Processed features ready for model prediction
+        """
+        logger.info(f"Transforming test features with shape {X_test.shape}")
+        
+        # Step 1: Apply smart preprocessing pipeline (same as training)
+        X_processed = self.process_dataset(X_test, "inference")
+        
+        # Step 2: Apply categorical encoding using trained encoders
+        for cat_feature, mapping in self.label_encoders.items():
+            if cat_feature in X_processed.columns:
+                encoded_col = f'{cat_feature}_encoded'
+                cats = X_processed[cat_feature].fillna('MISSING').astype(str)
+                X_processed[encoded_col] = cats.map(mapping).fillna(0)  # Unknown categories get 0
+        
+        # Step 3: Handle missing values in the same way as training
+        feature_columns = []
+        
+        # Add direct features (if they exist)
+        for feature in self.feature_config.direct_features:
+            if feature in X_processed.columns:
+                feature_columns.append(feature)
+        
+        # Add transformed features based on naming conventions
+        for col in X_processed.columns:
+            if (col.endswith('_cap') or col.endswith('_log') or col.endswith('_win_cap') or col.endswith('_encoded')):
+                if col not in feature_columns:
+                    feature_columns.append(col)
+        
+        # Step 4: Fill missing values for final features
+        for col in feature_columns:
+            if col in X_processed.columns:
+                if X_processed[col].dtype in [np.float64, np.int64, np.float32, np.int32]:
+                    fill_value = X_processed[col].median()
+                    if np.isnan(fill_value):
+                        fill_value = 0
+                else:
+                    fill_value = X_processed[col].mode().iloc[0] if not X_processed[col].mode().empty else 0
+                
+                X_processed[col] = X_processed[col].fillna(fill_value)
+        
+        # Step 5: Return only the features that should exist based on training
+        available_features = [col for col in feature_columns if col in X_processed.columns]
+        
+        logger.info(f"Test feature transformation complete. Features: {len(available_features)}")
+        
+        return X_processed[available_features]
     
     def process_dataset(self, dataset: pd.DataFrame, dataset_name: str = None) -> pd.DataFrame:
         """Process any dataset with smart preprocessing pipeline"""
