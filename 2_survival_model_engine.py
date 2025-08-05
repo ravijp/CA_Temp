@@ -234,19 +234,20 @@ class SmartFeatureProcessor:
         
         df_processed = dataset.copy()
         
-        # Get all potential features for transformations
-        all_features = (self.feature_config.iqr_cap_features + 
-                       self.feature_config.log_transform_features + 
-                       self.feature_config.winsorize_features)
+        # Step 1: IQR-based capping (only for features that need it AND exist)
+        iqr_features = [f for f in self.feature_config.iqr_cap_features if f in df_processed.columns]
+        if iqr_features:
+            df_processed = self._iqr_cap_outliers(df_processed, iqr_features)
         
-        # Step 1: IQR-based capping (only for features that need it)
-        df_processed = self._iqr_cap_outliers(df_processed, all_features)
+        # Step 2: Log transformation (only for features that need it AND exist)
+        log_features = [f for f in self.feature_config.log_transform_features if f in df_processed.columns]
+        if log_features:
+            df_processed = self._log_transform_features(df_processed, log_features)
         
-        # Step 2: Log transformation (only for features that need it)
-        df_processed = self._log_transform_features(df_processed, all_features)
-        
-        # Step 3: Winsorization (only for features that need it)
-        df_processed = self._winsorize_features(df_processed, all_features)
+        # Step 3: Winsorization (only for features that need it AND exist)
+        win_features = [f for f in self.feature_config.winsorize_features if f in df_processed.columns]
+        if win_features:
+            df_processed = self._winsorize_features(df_processed, win_features)
         
         logger.info(f"Smart preprocessing complete for {dataset_name or 'dataset'}")
         return df_processed
