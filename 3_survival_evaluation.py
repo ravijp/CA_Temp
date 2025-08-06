@@ -795,6 +795,31 @@ class SurvivalEvaluation:
         
         print(f"Diagnostic plots saved to {self.config.diagnostic_plots_path}")
     
+    def _get_survival_probabilities_at_time(self, predictions: np.ndarray, time: int) -> np.ndarray:
+        """Get survival probabilities at specific time point"""
+        # Use AFT formulation to calculate survival at time t
+        sigma = self.model_engine.model_parameters.sigma
+        distribution = self.model_engine.model_parameters.distribution
+        
+        log_time = np.log(time)
+        z_scores = (log_time - predictions) / sigma
+        
+        if distribution.value == 'normal':
+            survival_probs = 1 - stats.norm.cdf(z_scores)
+        elif distribution.value == 'logistic':
+            survival_probs = 1 / (1 + np.exp(z_scores))
+        elif distribution.value == 'extreme':
+            survival_probs = np.exp(-np.exp(z_scores))
+        else:
+            survival_probs = 1 - stats.norm.cdf(z_scores)  # Default
+        
+        return np.clip(survival_probs, 1e-6, 1 - 1e-6)
+    
+    def _create_binary_outcome_at_time(self, actuals: np.ndarray, events: np.ndarray, 
+                                     time: int) -> np.ndarray:
+        """Create binary outcome indicator for specific time"""
+        return ((actuals <= time) & (events == 1)).astype(float)
+    
     def plot_performance_comparison(self, val_metrics: Dict, oot_metrics: Dict) -> None:
         """
         VAL vs OOT performance visualization and analysis
