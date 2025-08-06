@@ -1391,33 +1391,483 @@ class SurvivalEvaluation:
             return np.nan
 
     def _plot_residual_diagnostics(self, predictions, y, events, dataset_name):
-        """residual diagnostic plots"""
-        print(f"Generated residual diagnostics for {dataset_name}")
-    
-    def _plot_multi_horizon_calibration(self, X, y, events, horizons, dataset_name):
-        """Multi-horizon calibration plots"""  
-        print(f"Generated calibration plots for {dataset_name}")
-    
-    def _plot_risk_score_analysis(self, risk_scores, events, dataset_name):
-        """risk score analysis plots"""
-        print(f"Generated risk score analysis for {dataset_name}")
-    
-    def _plot_core_metrics_comparison(self, val_metrics, oot_metrics, ax):
-        """Core metrics comparison plot"""
-        ax.text(0.5, 0.5, 'Core Metrics Comparison', ha='center', va='center')
-    
-    def _plot_calibration_comparison(self, val_metrics, oot_metrics, ax):
-        """Calibration comparison plot"""
-        ax.text(0.5, 0.5, 'Calibration Comparison', ha='center', va='center')
-    
-    def _plot_performance_degradation(self, val_metrics, oot_metrics, ax):
-        """Performance degradation plot"""
-        ax.text(0.5, 0.5, 'Performance Degradation', ha='center', va='center')
-    
-    def _plot_significance_indicators(self, val_metrics, oot_metrics, ax):
-        """Statistical significance indicators"""
-        ax.text(0.5, 0.5, 'Significance Indicators', ha='center', va='center')
+        """AFT-specific residual diagnostic plots"""
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        
+        # Calculate AFT residuals
+        log_y = np.log(y)
+        residuals = log_y - predictions
+        uncensored_mask = events == 1
+        
+        # 1. Predicted vs Actual
+        scatter = axes[0, 0].scatter(y, np.exp(predictions), c=events, alpha=0.6, 
+                                cmap='coolwarm', s=20)
+        axes[0, 0].plot([y.min(), y.max()], [y.min(), y.max()], 'k--', lw=2)
+        axes[0, 0].set_xlabel('Actual Survival Time (days)')
+        axes[0, 0].set_ylabel('Predicted Survival Time (days)')
+        axes[0, 0].set_title('Predicted vs Actual')
+        plt.colorbar(scatter, ax=axes[0, 0], label='Event (1=Yes, 0=Censored)')
+        
+        # 2. Residual distribution
+        axes[0, 1].hist(residuals[uncensored_mask], bins=50, alpha=0.7, 
+                    density=True, color='blue', label='Uncensored')
+        axes[0, 1].hist(residuals[~uncensored_mask], bins=50, alpha=0.7, 
+                    density=True, color='red', label='Censored')
+        x_range = np.linspace(residuals.min(), residuals.max(), 100)
+        axes[0, 1].plot(x_range, stats.norm.pdf(x_range, 0, residuals.std()), 
+                    'k--', lw=2, label='Normal')
+        axes[0, 1].set_xlabel('Residuals (log scale)')
+        axes[0, 1].set_ylabel('Density')
+        axes[0, 1].set_title('Residual Distribution')
+        axes[0, 1].legend()
+        
+        # 3. Q-Q plot (uncensored only)
+        uncensored_residuals = residuals[uncensored_mask]
+        if len(uncensored_residuals) > 20:
+            stats.probplot(uncensored_residuals, dist="norm", plot=axes[1, 0])
+            axes[1, 0].set_title('Q-Q Plot (Uncensored Only)')
+        
+        # 4. Residuals vs Predicted
+        axes[1, 1].scatter(predictions, residuals, c=events, alpha=0.6, 
+                        cmap='coolwarm', s=20)
+        axes[1, 1].axhline(y=0, color='k', linestyle='--', lw=2)
+        axes[1, 1].set_xlabel('Predicted (log scale)')
+        axes[1, 1].set_ylabel('Residuals')
+        axes[1, 1].set_title('Residuals vs Predicted Values')
+        
+        plt.suptitle(f'Residual Diagnostics: {dataset_name}', fontsize=16, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(f'{self.config.diagnostic_plots_path}/residual_diagnostics_{dataset_name}.png', 
+                dpi=300, bbox_inches='tight')
+        plt.show()
 
+    def _plot_multi_horizon_calibration(self, predictions, y, events, horizons, dataset_name):
+        """Multi-time-point calibration analysis plots"""
+        n_horizons = len(horizons)
+        cols = 2
+        rows = (n_horizons + 1) // 2
+        
+        fig, axes = plt.subplots(rows, cols, figsize=(16, 6*rows))
+        if rows == 1:
+            axes = axes.reshape(1, -1)
+        axes = axes.ravel()
+        
+        for i, horizon in enumerate(horizons):
+            ax = axes[i] if i < len(axes) else None
+            if ax is None:
+                continue
+                
+            try:
+                # Get survival probabilities at horizon
+                survival_probs = self._get_survival_probabilities_at_time(predictions, horizon)
+                
+                # Create binary outcome
+                binary_outcome = self._create_binary_outcome_at_time(y, events, horizon)
+                
+                # Calculate calibration curve
+                fraction_surviving, mean_predicted = calibration_curve(
+                    binary_outcome, survival_probs, n_bins=self.config.calibration_bins,
+                    strategy='quantile'
+                )
+                
+                # Plot perfect calibration line
+                ax.plot([0, 1], [0, 1], 'k--', lw=2, label='Perfect calibration')
+                
+                # Plot model calibration
+                ax.plot(mean_predicted, fraction_surviving, 'o-', markersize=8, 
+                    linewidth=3, label=f'Model ({horizon}d)')
+                
+                # Add confidence intervals
+                n_samples = len(y)
+                ci_lower = fraction_surviving - 1.96 * np.sqrt(
+                    fraction_surviving * (1 - fraction_surviving) / n_samples)
+                ci_upper = fraction_surviving + 1.96 * np.sqrt(
+                    fraction_surviving * (1 - fraction_surviving) / n_samples)
+                
+                ax.fill_between(mean_predicted, ci_lower, ci_upper, alpha=0.3)
+                
+                # Calculate ECE
+                bin_sizes = np.histogram(survival_probs, bins=self.config.calibration_bins)[0]
+                bin_sizes = bin_sizes / bin_sizes.sum()
+                ece = np.sum(bin_sizes * np.abs(fraction_surviving - mean_predicted))
+                
+                ax.set_xlabel(f'Mean Predicted Survival at {horizon} days')
+                ax.set_ylabel(f'Fraction Actually Surviving at {horizon} days')
+                ax.set_title(f'Calibration at {horizon} Days (ECE={ece:.4f})')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                ax.set_xlim(-0.05, 1.05)
+                ax.set_ylim(-0.05, 1.05)
+                
+            except Exception as e:
+                ax.text(0.5, 0.5, f'Error: {str(e)}', ha='center', va='center', 
+                    transform=ax.transAxes)
+                ax.set_title(f'Calibration at {horizon} Days - Error')
+        
+        # Hide unused subplots
+        for i in range(len(horizons), len(axes)):
+            axes[i].set_visible(False)
+        
+        plt.suptitle(f'Multi-Horizon Calibration Analysis: {dataset_name}', 
+                    fontsize=16, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(f'{self.config.diagnostic_plots_path}/calibration_{dataset_name}.png', 
+                dpi=300, bbox_inches='tight')
+        plt.show()
+
+    def _plot_survival_curve_analysis(self, survival_curves, y, events, dataset_name):
+        """Survival curve quality and variance analysis plots"""
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        
+        # 1. Sample survival curves
+        n_curves = min(20, len(survival_curves))
+        time_points = np.arange(1, survival_curves.shape[1] + 1)
+        
+        for i in range(n_curves):
+            axes[0, 0].plot(time_points, survival_curves[i], alpha=0.3, color='blue')
+        
+        # Mean curve with confidence intervals
+        mean_curve = np.mean(survival_curves, axis=0)
+        std_curve = np.std(survival_curves, axis=0)
+        axes[0, 0].plot(time_points, mean_curve, 'r-', linewidth=3, label='Mean')
+        axes[0, 0].fill_between(time_points, 
+                            mean_curve - 1.96 * std_curve / np.sqrt(len(survival_curves)),
+                            mean_curve + 1.96 * std_curve / np.sqrt(len(survival_curves)),
+                            alpha=0.3, color='red', label='95% CI')
+        axes[0, 0].set_xlabel('Time (days)')
+        axes[0, 0].set_ylabel('Survival Probability')
+        axes[0, 0].set_title(f'Sample Survival Curves (n={n_curves})')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # 2. Final survival probability distribution
+        final_survivals = survival_curves[:, -1]
+        axes[0, 1].hist(final_survivals, bins=50, alpha=0.7, density=True, color='skyblue')
+        axes[0, 1].axvline(final_survivals.mean(), color='red', linestyle='--', 
+                        linewidth=2, label=f'Mean: {final_survivals.mean():.3f}')
+        axes[0, 1].axvline(np.median(final_survivals), color='orange', linestyle='--', 
+                        linewidth=2, label=f'Median: {np.median(final_survivals):.3f}')
+        axes[0, 1].set_xlabel('Final Survival Probability')
+        axes[0, 1].set_ylabel('Density')
+        axes[0, 1].set_title('Distribution of Final Survival Probabilities')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # 3. Survival variance over time
+        variance_over_time = np.var(survival_curves, axis=0)
+        axes[1, 0].plot(time_points, variance_over_time, 'g-', linewidth=2)
+        axes[1, 0].set_xlabel('Time (days)')
+        axes[1, 0].set_ylabel('Survival Probability Variance')
+        axes[1, 0].set_title('Survival Curve Variance Over Time')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # 4. Monotonicity check
+        monotonicity_violations = []
+        for curve in survival_curves:
+            diffs = np.diff(curve)
+            violations = np.sum(diffs > 1e-6)
+            monotonicity_violations.append(violations)
+        
+        axes[1, 1].hist(monotonicity_violations, bins=20, alpha=0.7, color='orange')
+        axes[1, 1].set_xlabel('Number of Monotonicity Violations')
+        axes[1, 1].set_ylabel('Frequency')
+        axes[1, 1].set_title('Monotonicity Violations per Curve')
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.suptitle(f'Survival Curve Analysis: {dataset_name}', fontsize=16, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(f'{self.config.diagnostic_plots_path}/survival_curves_{dataset_name}.png', 
+                dpi=300, bbox_inches='tight')
+        plt.show()
+
+    def _plot_risk_score_analysis(self, risk_scores, events, dataset_name):
+        """Risk score distribution and effectiveness plots"""
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        
+        # 1. Risk score distribution by event status
+        event_mask = events == 1
+        axes[0, 0].hist(risk_scores[event_mask], bins=50, alpha=0.7, 
+                    density=True, color='red', label='Events')
+        axes[0, 0].hist(risk_scores[~event_mask], bins=50, alpha=0.7, 
+                    density=True, color='blue', label='Censored')
+        axes[0, 0].set_xlabel('Risk Score')
+        axes[0, 0].set_ylabel('Density')
+        axes[0, 0].set_title('Risk Score Distribution by Event Status')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # 2. Risk score deciles analysis
+        deciles = np.percentile(risk_scores, np.arange(10, 101, 10))
+        decile_labels = [f'D{i}' for i in range(1, 11)]
+        decile_event_rates = []
+        
+        for i in range(len(deciles)):
+            if i == 0:
+                mask = risk_scores <= deciles[i]
+            else:
+                mask = (risk_scores > deciles[i-1]) & (risk_scores <= deciles[i])
+            
+            if np.sum(mask) > 0:
+                event_rate = np.mean(events[mask])
+                decile_event_rates.append(event_rate)
+            else:
+                decile_event_rates.append(0)
+        
+        bars = axes[0, 1].bar(decile_labels, decile_event_rates, alpha=0.7, color='green')
+        overall_rate = np.mean(events)
+        axes[0, 1].axhline(y=overall_rate, color='red', linestyle='--', 
+                        label=f'Overall Rate ({overall_rate:.3f})')
+        axes[0, 1].set_xlabel('Risk Score Decile')
+        axes[0, 1].set_ylabel('Event Rate')
+        axes[0, 1].set_title('Event Rate by Risk Score Decile')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Add values on bars
+        for bar, rate in zip(bars, decile_event_rates):
+            axes[0, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005,
+                        f'{rate:.3f}', ha='center', va='bottom', fontsize=9)
+        
+        # 3. Cumulative event capture
+        sorted_indices = np.argsort(risk_scores)[::-1]  # Descending order
+        sorted_events = events[sorted_indices]
+        cumulative_events = np.cumsum(sorted_events) / np.sum(events)
+        cumulative_population = np.arange(1, len(events) + 1) / len(events)
+        
+        axes[1, 0].plot(cumulative_population, cumulative_events, 'b-', linewidth=2, 
+                    label='Model')
+        axes[1, 0].plot([0, 1], [0, 1], 'k--', linewidth=2, label='Random')
+        axes[1, 0].fill_between(cumulative_population, cumulative_events, 
+                            cumulative_population, alpha=0.3)
+        axes[1, 0].set_xlabel('Cumulative % Population')
+        axes[1, 0].set_ylabel('Cumulative % Events Captured')
+        axes[1, 0].set_title('Cumulative Event Capture (Lorenz Curve)')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # 4. Risk score statistics
+        stats_text = f"""Risk Score Statistics:
+        Mean: {np.mean(risk_scores):.4f}
+        Std: {np.std(risk_scores):.4f}
+        Min: {np.min(risk_scores):.4f}
+        Max: {np.max(risk_scores):.4f}
+        Range: {np.ptp(risk_scores):.4f}
+        
+        Event Rates:
+        Top 10%: {np.mean(events[risk_scores >= np.percentile(risk_scores, 90)]):.3f}
+        Bottom 10%: {np.mean(events[risk_scores <= np.percentile(risk_scores, 10)]):.3f}
+        Separation: {np.mean(events[risk_scores >= np.percentile(risk_scores, 90)]) - np.mean(events[risk_scores <= np.percentile(risk_scores, 10)]):.3f}"""
+        
+        axes[1, 1].text(0.05, 0.95, stats_text, transform=axes[1, 1].transAxes, 
+                    fontsize=11, verticalalignment='top', fontfamily='monospace',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        axes[1, 1].set_title('Risk Score Statistics')
+        axes[1, 1].axis('off')
+        
+        plt.suptitle(f'Risk Score Analysis: {dataset_name}', fontsize=16, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(f'{self.config.diagnostic_plots_path}/risk_scores_{dataset_name}.png', 
+                dpi=300, bbox_inches='tight')
+        plt.show()
+
+    def _plot_core_metrics_comparison(self, val_metrics, oot_metrics, ax):
+        """VAL vs OOT core metrics visualization"""
+        metrics = ['c_index', 'gini_coefficient', 'average_ece', 'integrated_brier_score']
+        metric_labels = ['C-Index', 'Gini', 'Avg ECE', 'IBS']
+        
+        val_values = []
+        oot_values = []
+        
+        for metric in metrics:
+            val_val = val_metrics.get(metric, np.nan)
+            oot_val = oot_metrics.get(metric, np.nan)
+            val_values.append(val_val if not np.isnan(val_val) else 0)
+            oot_values.append(oot_val if not np.isnan(oot_val) else 0)
+        
+        x = np.arange(len(metric_labels))
+        width = 0.35
+        
+        bars1 = ax.bar(x - width/2, val_values, width, label='VAL', alpha=0.8, color='blue')
+        bars2 = ax.bar(x + width/2, oot_values, width, label='OOT', alpha=0.8, color='orange')
+        
+        ax.set_xlabel('Metrics')
+        ax.set_ylabel('Metric Value')
+        ax.set_title('Core Metrics: VAL vs OOT')
+        ax.set_xticks(x)
+        ax.set_xticklabels(metric_labels)
+        ax.legend()
+        ax.grid(True, alpha=0.3, axis='y')
+        
+        # Add value labels on bars
+        for bars, values in [(bars1, val_values), (bars2, oot_values)]:
+            for bar, value in zip(bars, values):
+                if value > 0:
+                    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                        f'{value:.3f}', ha='center', va='bottom', fontsize=9)
+
+    def _plot_calibration_comparison(self, val_metrics, oot_metrics, ax):
+        """VAL vs OOT calibration comparison"""
+        horizons = self.config.time_horizons
+        
+        val_eces = []
+        oot_eces = []
+        
+        for horizon in horizons:
+            val_ece = val_metrics.get(f'ece_{horizon}d', np.nan)
+            oot_ece = oot_metrics.get(f'ece_{horizon}d', np.nan)
+            val_eces.append(val_ece if not np.isnan(val_ece) else 0)
+            oot_eces.append(oot_ece if not np.isnan(oot_ece) else 0)
+        
+        x = np.arange(len(horizons))
+        
+        ax.plot(x, val_eces, 'o-', linewidth=2, markersize=8, label='VAL', color='blue')
+        ax.plot(x, oot_eces, 's-', linewidth=2, markersize=8, label='OOT', color='orange')
+        
+        ax.set_xlabel('Time Horizon (days)')
+        ax.set_ylabel('Expected Calibration Error')
+        ax.set_title('Calibration Error: VAL vs OOT')
+        ax.set_xticks(x)
+        ax.set_xticklabels([f'{h}d' for h in horizons])
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Add horizontal line for excellent calibration threshold
+        ax.axhline(y=0.05, color='green', linestyle='--', alpha=0.7, label='Excellent (<0.05)')
+        ax.axhline(y=0.10, color='yellow', linestyle='--', alpha=0.7, label='Good (<0.10)')
+
+    def _plot_performance_degradation(self, val_metrics, oot_metrics, ax):
+        """Performance degradation analysis visualization"""
+        degradation_metrics = []
+        degradation_values = []
+        colors = []
+        
+        metrics_to_check = [
+            ('c_index', 'C-Index', 'higher_better'),
+            ('gini_coefficient', 'Gini', 'higher_better'),
+            ('average_ece', 'Avg ECE', 'lower_better'),
+            ('integrated_brier_score', 'IBS', 'lower_better')
+        ]
+        
+        for metric, label, direction in metrics_to_check:
+            val_val = val_metrics.get(metric, np.nan)
+            oot_val = oot_metrics.get(metric, np.nan)
+            
+            if not (np.isnan(val_val) or np.isnan(oot_val)):
+                if direction == 'higher_better':
+                    degradation = val_val - oot_val  # Positive = degradation
+                else:
+                    degradation = oot_val - val_val  # Positive = degradation
+                
+                degradation_metrics.append(label)
+                degradation_values.append(degradation)
+                
+                # Color coding
+                if abs(degradation) > 0.05:
+                    colors.append('red')
+                elif abs(degradation) > 0.02:
+                    colors.append('orange')
+                else:
+                    colors.append('green')
+        
+        if degradation_metrics:
+            bars = ax.bar(degradation_metrics, degradation_values, color=colors, alpha=0.7)
+            ax.axhline(y=0, color='black', linestyle='-', linewidth=1)
+            ax.axhline(y=0.05, color='red', linestyle='--', alpha=0.5, label='Severe (>0.05)')
+            ax.axhline(y=-0.05, color='red', linestyle='--', alpha=0.5)
+            ax.axhline(y=0.02, color='orange', linestyle='--', alpha=0.5, label='Moderate (>0.02)')
+            ax.axhline(y=-0.02, color='orange', linestyle='--', alpha=0.5)
+            
+            ax.set_xlabel('Metrics')
+            ax.set_ylabel('Performance Degradation')
+            ax.set_title('VAL to OOT Performance Degradation')
+            ax.legend()
+            ax.grid(True, alpha=0.3, axis='y')
+            
+            # Add value labels
+            for bar, value in zip(bars, degradation_values):
+                ax.text(bar.get_x() + bar.get_width()/2, 
+                    bar.get_height() + (0.002 if value >= 0 else -0.005),
+                    f'{value:+.3f}', ha='center', 
+                    va='bottom' if value >= 0 else 'top', fontsize=9)
+        else:
+            ax.text(0.5, 0.5, 'No valid degradation data', ha='center', va='center',
+                transform=ax.transAxes, fontsize=12)
+            ax.set_title('Performance Degradation - No Data')
+
+    def _plot_significance_indicators(self, val_metrics, oot_metrics, ax):
+        """Statistical significance indicators for VAL vs OOT"""
+        # Calculate effect sizes and significance indicators
+        significance_data = []
+        
+        metrics_info = [
+            ('c_index', 'C-Index', 'higher_better'),
+            ('gini_coefficient', 'Gini Coefficient', 'higher_better'),
+            ('average_ece', 'Average ECE', 'lower_better')
+        ]
+        
+        for metric, label, direction in metrics_info:
+            val_val = val_metrics.get(metric, np.nan)
+            oot_val = oot_metrics.get(metric, np.nan)
+            
+            if not (np.isnan(val_val) or np.isnan(oot_val)):
+                # Calculate effect size (Cohen's d approximation)
+                difference = abs(val_val - oot_val)
+                pooled_std = (abs(val_val) + abs(oot_val)) / 4  # Rough approximation
+                effect_size = difference / pooled_std if pooled_std > 0 else 0
+                
+                # Determine significance level (simplified)
+                if effect_size > 0.8:
+                    significance = 'Large Effect'
+                    color = 'red'
+                elif effect_size > 0.5:
+                    significance = 'Medium Effect'
+                    color = 'orange'
+                elif effect_size > 0.2:
+                    significance = 'Small Effect'
+                    color = 'yellow'
+                else:
+                    significance = 'Negligible'
+                    color = 'green'
+                
+                significance_data.append({
+                    'metric': label,
+                    'val_value': val_val,
+                    'oot_value': oot_val,
+                    'effect_size': effect_size,
+                    'significance': significance,
+                    'color': color
+                })
+        
+        if significance_data:
+            # Create significance visualization
+            y_pos = np.arange(len(significance_data))
+            effect_sizes = [d['effect_size'] for d in significance_data]
+            colors = [d['color'] for d in significance_data]
+            
+            bars = ax.barh(y_pos, effect_sizes, color=colors, alpha=0.7)
+            
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels([d['metric'] for d in significance_data])
+            ax.set_xlabel('Effect Size (|VAL - OOT|)')
+            ax.set_title('Statistical Significance Indicators')
+            
+            # Add effect size thresholds
+            ax.axvline(x=0.2, color='gray', linestyle='--', alpha=0.5, label='Small (0.2)')
+            ax.axvline(x=0.5, color='gray', linestyle='--', alpha=0.5, label='Medium (0.5)')
+            ax.axvline(x=0.8, color='gray', linestyle='--', alpha=0.5, label='Large (0.8)')
+            ax.legend()
+            ax.grid(True, alpha=0.3, axis='x')
+            
+            # Add text annotations
+            for i, (bar, data) in enumerate(zip(bars, significance_data)):
+                ax.text(bar.get_width() + 0.05, bar.get_y() + bar.get_height()/2,
+                    f"{data['significance']}\n({data['effect_size']:.2f})",
+                    ha='left', va='center', fontsize=8)
+        else:
+            ax.text(0.5, 0.5, 'No significance data available', ha='center', va='center',
+                transform=ax.transAxes, fontsize=12)
+            ax.set_title('Statistical Significance - No Data')
+            
     def _assess_distribution_fit(self, predictions, actuals, events):
         """distribution fit assessment"""
         return {"status": "Distribution fit assessment completed"}
