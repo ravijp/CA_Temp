@@ -157,25 +157,36 @@ class BaselineComparison:
         summary.append(f"   IPCW Brier Score: {aft['ipcw_brier_score']:.4f}")
         summary.append(f"   Log-Likelihood: {aft['log_likelihood']:.2f}")
         
-        # Baseline Performance
+        # Baseline Performance with sample sizes
         summary.append(f"\nBASELINE MODEL PERFORMANCE:")
         for name, baseline in baselines.items():
             summary.append(f"   {name.upper().replace('_', ' ')}:")
             summary.append(f"     C-Index: {baseline.c_index:.4f}")
             summary.append(f"     IPCW Brier: {baseline.ipcw_brier_score:.4f}")
             summary.append(f"     Log-Likelihood: {baseline.log_likelihood:.2f}")
+            summary.append(f"     Sample Size: {baseline.sample_size}")
         
-        # Key Improvements
+        # Key Improvements with interpretation
         summary.append(f"\nPERFORMANCE IMPROVEMENTS:")
         best_baseline = max(baselines.values(), key=lambda x: x.c_index)
+        c_improvement = aft['c_index'] - best_baseline.c_index
+        relative_improvement = (c_improvement / best_baseline.c_index) * 100
+        
         summary.append(f"   Best Baseline: {best_baseline.model_name}")
-        summary.append(f"   C-Index Improvement: +{aft['c_index'] - best_baseline.c_index:.4f}")
+        summary.append(f"   C-Index Improvement: +{c_improvement:.4f} ({relative_improvement:.1f}% relative)")
         summary.append(f"   Brier Score Improvement: +{best_baseline.ipcw_brier_score - aft['ipcw_brier_score']:.4f}")
         
-        # Deployment Decision
+        # Enhanced deployment decision with thresholds
         summary.append(f"\nDEPLOYMENT RECOMMENDATION:")
         summary.append(f"   {self.comparison_results['deployment_recommendation']}")
         summary.append(f"   Improvement: +{self.comparison_results['best_baseline_improvement']:.4f} C-index")
+        
+        # Add interpretation thresholds
+        summary.append(f"\nINTERPRETATION GUIDE:")
+        summary.append(f"   Substantial: >+0.10 C-index improvement")
+        summary.append(f"   Moderate: +0.05 to +0.10 C-index improvement") 
+        summary.append(f"   Minimal: <+0.05 C-index improvement")
+        summary.append(f"   Current: +{c_improvement:.4f} ({'Substantial' if c_improvement >= 0.10 else 'Moderate' if c_improvement >= 0.05 else 'Minimal'})")
         
         return "\n".join(summary)
     
@@ -285,17 +296,26 @@ class BaselineComparison:
             X_train.copy(), y_train, events_train
         )
         
-        # Fit KM curves by demographic stratum
+        # Fit KM curves by demographic stratum with validation
         demo_km_curves = {}
         for stratum in train_df[demo_col].unique():
             stratum_data = train_df[train_df[demo_col] == stratum]
-            if len(stratum_data) >= 10:
+            # Require minimum 100 samples for robust demographic stratification
+            if len(stratum_data) >= 100:
                 kmf = KaplanMeierFitter()
                 try:
                     kmf.fit(stratum_data['survival_time'], stratum_data['event'])
-                    demo_km_curves[stratum] = kmf
-                except:
-                    continue
+                    # Validate KM curve quality
+                    if len(kmf.survival_function_) > 1 and kmf.survival_function_.iloc[0, 0] > 0.1:
+                        demo_km_curves[stratum] = kmf
+                    else:
+                        logger.warning(f"Low-quality KM curve for stratum {stratum}")
+                except Exception as e:
+                    logger.warning(f"KM fitting failed for stratum {stratum}: {e}")
+            else:
+                logger.info(f"Insufficient samples for stratum {stratum}: {len(stratum_data)}")
+        
+        logger.info(f"Successfully fitted {len(demo_km_curves)} demographic KM curves")
         
         # Generate predictions for validation set
         val_data = datasets.get('val') or datasets[list(datasets.keys())[0]]
@@ -378,67 +398,161 @@ class BaselineComparison:
     
     def _calculate_km_ipcw_brier(self, predictions: np.ndarray, y: np.ndarray,
                                 events: np.ndarray, horizon: int) -> float:
-        """Calculate IPCW Brier score for KM predictions"""
+        """Calculate IPCW Brier score for KM predictions with robust fallback"""
         
-        # Use existing IPCW calculation if available
+        # Attempt to use existing IPCW calculation with enhanced error handling
         if (hasattr(self.evaluation, 'brier_calculator') and 
             self.evaluation.brier_calculator is not None):
             try:
                 # Create dummy model for IPCW calculation
                 class DummyModel:
+                    def __init__(self, fixed_predictions):
+                        self.fixed_predictions = np.log(np.clip(fixed_predictions, 1e-8, 1-1e-8))
+                    
                     def predict(self, X):
-                        return np.log(predictions)  # Convert to log scale for consistency
+                        # Return same predictions regardless of input
+                        return np.full(len(X), self.fixed_predictions[0])
                 
-                dummy_model = DummyModel()
+                dummy_model = DummyModel(predictions)
+                
+                # Create minimal feature matrix
+                X_dummy = pd.DataFrame(np.random.randn(len(predictions), 3))
+                
                 brier_result = self.evaluation.brier_calculator.calculate_brier_scores(
                     model=dummy_model,
-                    X_val=pd.DataFrame(np.random.randn(len(predictions), 5)),  # Dummy features
+                    X_val=X_dummy,
                     y_val=y,
                     events_val=events,
-                    time_points=np.array([horizon])
+                    time_points=np.array([horizon]),
+                    use_ipcw=True,
+                    compute_ci=False
                 )
-                return brier_result.brier_scores[0]
-            except:
-                pass
+                
+                if hasattr(brier_result, 'brier_scores') and len(brier_result.brier_scores) > 0:
+                    brier_score = brier_result.brier_scores[0]
+                    # Validate result
+                    if np.isfinite(brier_score) and 0 <= brier_score <= 1:
+                        return brier_score
+            except Exception as e:
+                logger.warning(f"Advanced IPCW Brier calculation failed: {e}")
         
-        # Fallback: Simple Brier score calculation
-        binary_outcome = ((y <= horizon) & (events == 1)).astype(float)
-        return np.mean((predictions - binary_outcome) ** 2)
+        # Robust fallback: Direct IPCW calculation
+        return self._calculate_direct_ipcw_brier(predictions, y, events, horizon)
+    
+    def _calculate_direct_ipcw_brier(self, predictions: np.ndarray, y: np.ndarray,
+                                   events: np.ndarray, horizon: int) -> float:
+        """Direct IPCW Brier score calculation without dummy model dependency"""
+        
+        try:
+            from lifelines import KaplanMeierFitter
+            
+            # Fit censoring distribution (reverse events for censoring KM)
+            kmf_censor = KaplanMeierFitter()
+            kmf_censor.fit(y, 1 - events)  # Censoring survival function
+            
+            # Calculate IPCW weights
+            weights = []
+            binary_outcomes = []
+            valid_predictions = []
+            
+            for i, (time, event, pred) in enumerate(zip(y, events, predictions)):
+                # Define binary outcome at horizon
+                if time <= horizon and event == 1:
+                    outcome = 1.0  # Event by horizon
+                elif time > horizon:
+                    outcome = 0.0  # Survived past horizon
+                else:
+                    outcome = 0.0  # Censored before horizon
+                
+                # Calculate IPCW weight
+                eval_time = min(time, horizon)
+                try:
+                    censor_survival = kmf_censor.survival_function_at_times([eval_time]).iloc[0]
+                    weight = 1.0 / max(censor_survival, 0.01)  # Avoid division by zero
+                except:
+                    weight = 1.0  # Fallback weight
+                
+                weights.append(weight)
+                binary_outcomes.append(outcome)
+                valid_predictions.append(pred)
+            
+            # Calculate weighted Brier score
+            weights = np.array(weights)
+            binary_outcomes = np.array(binary_outcomes)
+            valid_predictions = np.array(valid_predictions)
+            
+            # Event probability predictions (1 - survival probability)
+            event_predictions = 1 - valid_predictions
+            
+            # Weighted mean squared error
+            squared_errors = (event_predictions - binary_outcomes) ** 2
+            weighted_brier = np.average(squared_errors, weights=weights)
+            
+            return weighted_brier
+            
+        except Exception as e:
+            logger.warning(f"Direct IPCW calculation failed: {e}")
+            # Final fallback: Simple Brier score
+            binary_outcome = ((y <= horizon) & (events == 1)).astype(float)
+            event_predictions = 1 - predictions
+            return np.mean((event_predictions - binary_outcome) ** 2)
     
     def _calculate_km_log_likelihood(self, kmf: KaplanMeierFitter, 
                                     y: np.ndarray, events: np.ndarray) -> float:
-        """Calculate log-likelihood for KM model"""
+        """Calculate AFT-style log-likelihood for KM model for fair comparison"""
         
-        log_likelihood = 0.0
-        
-        for i, (time, event) in enumerate(zip(y, events)):
-            try:
-                if event == 1:
-                    # Event occurred: f(t) = hazard * survival
-                    survival_prob = kmf.survival_function_at_times(time).iloc[0]
-                    survival_prob = max(survival_prob, 1e-8)
+        try:
+            # Get KM survival function values
+            survival_times = kmf.survival_function_.index.values
+            survival_probs = kmf.survival_function_.iloc[:, 0].values
+            
+            total_log_likelihood = 0.0
+            
+            for time, event in zip(y, events):
+                try:
+                    # Find closest survival function value
+                    closest_idx = np.searchsorted(survival_times, time, side='right') - 1
+                    closest_idx = max(0, min(closest_idx, len(survival_probs) - 1))
                     
-                    # Approximate hazard calculation
-                    dt = 1.0
-                    if time + dt <= y.max():
-                        future_survival = kmf.survival_function_at_times(time + dt).iloc[0]
-                        hazard = (survival_prob - future_survival) / (dt * survival_prob)
+                    survival_at_time = max(survival_probs[closest_idx], 1e-8)
+                    
+                    if event == 1:
+                        # Event occurred: Use density approximation
+                        # f(t) ≈ hazard(t) * S(t) where hazard ≈ -d/dt[log(S(t))]
+                        
+                        if closest_idx < len(survival_probs) - 1:
+                            # Calculate hazard using discrete approximation
+                            next_survival = survival_probs[closest_idx + 1]
+                            time_diff = survival_times[closest_idx + 1] - survival_times[closest_idx]
+                            time_diff = max(time_diff, 1.0)
+                            
+                            hazard = (survival_at_time - next_survival) / (time_diff * survival_at_time)
+                            hazard = max(hazard, 1e-6)
+                            
+                            density = hazard * survival_at_time
+                        else:
+                            # At boundary, use small constant hazard
+                            hazard = 1e-4
+                            density = hazard * survival_at_time
+                        
+                        log_contribution = np.log(max(density, 1e-8))
+                        
                     else:
-                        hazard = 1e-3  # Small hazard for boundary cases
+                        # Censored: S(t)
+                        log_contribution = np.log(survival_at_time)
                     
-                    density = hazard * survival_prob
-                    log_likelihood += np.log(max(density, 1e-8))
+                    total_log_likelihood += log_contribution
                     
-                else:
-                    # Censored: S(t)
-                    survival_prob = kmf.survival_function_at_times(time).iloc[0]
-                    log_likelihood += np.log(max(survival_prob, 1e-8))
-                    
-            except:
-                # Handle edge cases
-                log_likelihood += np.log(1e-8)
-        
-        return log_likelihood
+                except:
+                    # Handle numerical issues
+                    total_log_likelihood += np.log(1e-8)
+            
+            return total_log_likelihood
+            
+        except Exception as e:
+            logger.warning(f"KM log-likelihood calculation failed: {e}")
+            # Fallback: rough approximation
+            return -len(y) * 10.0
     
     def _calculate_stratified_log_likelihood(self, X: pd.DataFrame, y: np.ndarray,
                                             events: np.ndarray, km_curves: Dict,
@@ -459,33 +573,33 @@ class BaselineComparison:
     
     def _create_demographic_strata(self, X: pd.DataFrame, y: np.ndarray = None,
                                   events: np.ndarray = None) -> pd.DataFrame:
-        """Create demographic strata using age and tenure"""
+        """Create demographic strata using age and tenure with robust bucketing"""
         
         # Add survival data if provided (for training)
         if y is not None and events is not None:
             X['survival_time'] = y
             X['event'] = events
         
-        # Age bands
+        # Age bands - broader buckets to ensure adequate sample sizes
         age_col = self._get_age_column(X)
         if age_col:
             X['age_band'] = pd.cut(X[age_col], 
-                                 bins=[0, 30, 40, 50, 65, np.inf], 
-                                 labels=['<30', '30-40', '40-50', '50-65', '65+'])
+                                 bins=[0, 35, 50, np.inf], 
+                                 labels=['<35', '35-50', '50+'])
         else:
             X['age_band'] = 'Unknown'
         
-        # Tenure bands
+        # Tenure bands - broader buckets to ensure adequate sample sizes  
         tenure_col = self._get_tenure_column(X)
         if tenure_col:
             tenure_years = X[tenure_col] / 365.25 if 'days' in tenure_col else X[tenure_col]
             X['tenure_band'] = pd.cut(tenure_years,
-                                    bins=[0, 1, 3, 5, 10, np.inf],
-                                    labels=['<1yr', '1-3yr', '3-5yr', '5-10yr', '10yr+'])
+                                    bins=[0, 2, 5, np.inf],
+                                    labels=['<2yr', '2-5yr', '5yr+'])
         else:
             X['tenure_band'] = 'Unknown'
         
-        # Combine for demographic stratum
+        # Combine for demographic stratum (3x3=9 combinations max)
         X['demo_stratum'] = X['age_band'].astype(str) + "_" + X['tenure_band'].astype(str)
         
         return X
