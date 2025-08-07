@@ -100,37 +100,57 @@ class SurvivalEvaluation:
         Expert-level feature processing compatibility handler with error handling
         """
         try:
-            # Strategy 1: Use fitted feature processor if available
+            # Strategy 1: Use updated feature processor method
             if (hasattr(self.model_engine, 'feature_processor') and 
                 self.model_engine.feature_processor and
-                hasattr(self.model_engine.feature_processor, 'scalers') and 
-                self.model_engine.feature_processor.scalers):
-                return self.model_engine.feature_processor._transform_test_features(X)
+                hasattr(self.model_engine.feature_processor, '_get_processed_features')):
+                return self.model_engine.feature_processor._get_processed_features(X)
             
-            # Strategy 2: Use stored feature columns if available
-            if (hasattr(self.model_engine, 'feature_columns') and 
-                self.model_engine.feature_columns):
+            # Strategy 2: Use SurvivalModelEngine's method (recommended)
+            elif hasattr(self.model_engine, '_get_processed_features'):
+                return self.model_engine._get_processed_features(X)
+            
+            # Strategy 3: Manual processing (fallback)
+            else:
+                logger.warning("Using manual feature processing - may be inconsistent")
+                return self._manual_feature_processing(X)
                 
-                # Check for missing features
-                missing_features = [f for f in self.model_engine.feature_columns if f not in X.columns]
-                if missing_features:
-                    logger.warning(f"Missing {len(missing_features)} expected features, using available features only")
-                    available_features = [f for f in self.model_engine.feature_columns if f in X.columns]
-                    if not available_features:
-                        raise SurvivalEvaluationError("No expected features found in input data")
-                    return X[available_features]
-                
-                return X[self.model_engine.feature_columns]
-            
-            # Strategy 3: Use features as-is (fallback)
-            logger.warning("Using all input features - no feature processing applied")
-            return X
-            
         except Exception as e:
-            # Debug the issue
             self.debug_feature_mismatch(X)
             raise SurvivalEvaluationError(f"Feature processing failed: {str(e)}")
+
+    def _manual_feature_processing(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Manual feature processing fallback that mimics updated pipeline"""
         
+        if not hasattr(self.model_engine, 'feature_columns'):
+            return X
+        
+        # Try to reconstruct the processing pipeline
+        X_processed = X.copy()
+        
+        # Apply categorical encoding if feature processor exists
+        if (hasattr(self.model_engine, 'feature_processor') and 
+            hasattr(self.model_engine.feature_processor, 'label_encoders')):
+            
+            for cat_feature, mapping in self.model_engine.feature_processor.label_encoders.items():
+                if cat_feature in X_processed.columns:
+                    encoded_col = f'{cat_feature}_encoded'
+                    cats = X_processed[cat_feature].fillna('MISSING').astype(str)
+                    
+                    # Use updated unknown category handling
+                    max_known_code = max(mapping.values()) if mapping else 0
+                    unknown_code = max_known_code + 1
+                    if 'UNKNOWN' not in mapping:
+                        mapping['UNKNOWN'] = unknown_code
+                        
+                    X_processed[encoded_col] = cats.map(mapping).fillna(unknown_code)
+        
+        # Select final features
+        available_features = [col for col in self.model_engine.feature_columns 
+                            if col in X_processed.columns]
+        
+        return X_processed[available_features] 
+    
     def _validate_model_state(self) -> None:
         """Comprehensive model state validation"""
         if self.model_engine is None:
@@ -151,7 +171,7 @@ class SurvivalEvaluation:
         
         try:
             test_data = pd.DataFrame(np.random.randn(5, 10))
-            test_pred = self.model_engine.model.predict(xgb.DMatrix(test_data))
+            test_pred = self.model_engine.model.predict(self.model_engine._create_categorical_aware_dmatrix(test_data))
             if len(test_pred) != 5:
                 raise SurvivalEvaluationError("Model prediction dimension mismatch")
         except Exception as e:
@@ -274,7 +294,7 @@ class SurvivalEvaluation:
         Returns:
             Dict: {f'{horizon}d': survival_probabilities}
         """
-        survival_curves = self.predict_survival_curves(X, np.array(horizons))
+        survival_curves = self.model_engine.predict_survival_curves(X, np.array(horizons))
         
         result = {}
         for i, horizon in enumerate(horizons):
@@ -286,6 +306,54 @@ class SurvivalEvaluation:
         
         return result
     
+
+    def _interpret_feature_importance_with_categorical_context(self, feature_importance_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Enhanced feature importance interpretation for categorical features
+        """
+        if not hasattr(self.model_engine, 'feature_processor'):
+            return feature_importance_df
+        
+        feature_processor = self.model_engine.feature_processor
+        interpreted_importance = feature_importance_df.copy()
+        
+        # Add columns for better interpretation
+        interpreted_importance['feature_type'] = 'numerical'
+        interpreted_importance['original_feature'] = interpreted_importance['feature']
+        interpreted_importance['transformation_applied'] = 'none'
+        
+        # Process categorical features
+        for idx, row in interpreted_importance.iterrows():
+            feature_name = row['feature']
+            
+            if feature_name.endswith('_encoded'):
+                # This is a categorical feature
+                original_name = feature_name.replace('_encoded', '')
+                interpreted_importance.at[idx, 'feature_type'] = 'categorical'
+                interpreted_importance.at[idx, 'original_feature'] = original_name
+                interpreted_importance.at[idx, 'transformation_applied'] = 'label_encoding'
+                
+                # Add category information if available
+                if (hasattr(feature_processor, 'label_encoders') and 
+                    original_name in feature_processor.label_encoders):
+                    n_categories = len(feature_processor.label_encoders[original_name])
+                    interpreted_importance.at[idx, 'n_categories'] = n_categories
+            
+            elif feature_name.endswith(('_cap', '_log', '_win_cap')):
+                # Numerical transformation
+                if hasattr(feature_processor, 'feature_name_mapping'):
+                    original = feature_processor.feature_name_mapping.get(feature_name, feature_name)
+                    interpreted_importance.at[idx, 'original_feature'] = original
+                    
+                    if feature_name.endswith('_cap'):
+                        interpreted_importance.at[idx, 'transformation_applied'] = 'iqr_capping'
+                    elif feature_name.endswith('_log'):
+                        interpreted_importance.at[idx, 'transformation_applied'] = 'log_transform'
+                    elif feature_name.endswith('_win_cap'):
+                        interpreted_importance.at[idx, 'transformation_applied'] = 'winsorization'
+        
+        return interpreted_importance
+
     def calculate_survival_metrics(self, X: pd.DataFrame, y_true: np.ndarray, 
                                           events: np.ndarray, use_ipcw: bool = True) -> Dict:
         """
@@ -304,7 +372,7 @@ class SurvivalEvaluation:
         
         try:
             X_processed = self._get_processed_features(X)
-            dmatrix = xgb.DMatrix(X_processed)
+            dmatrix = self.model_engine._create_categorical_aware_dmatrix(X_processed)
             log_predictions = self.model_engine.model.predict(dmatrix)
             pred_times = np.exp(log_predictions)
             
@@ -596,7 +664,7 @@ class SurvivalEvaluation:
         diagnostic_results = {}
         
         X_processed = self._get_processed_features(X)
-        dmatrix = xgb.DMatrix(X_processed)
+        dmatrix = self.model_engine._create_categorical_aware_dmatrix(X_processed)
         raw_predictions = self.model_engine.model.predict(dmatrix)
         
         # AFT assumption validation
@@ -737,7 +805,7 @@ class SurvivalEvaluation:
         validation_results = {}
         
         X_processed = self._get_processed_features(X)
-        dmatrix = xgb.DMatrix(X_processed)
+        dmatrix = self.model_engine._create_categorical_aware_dmatrix(X_processed)
         log_predictions = self.model_engine.model.predict(dmatrix)
         predicted_times = np.exp(log_predictions)
         risk_scores = self.model_engine.predict_risk_scores(X)
@@ -780,7 +848,7 @@ class SurvivalEvaluation:
         print(f"\nGenerating diagnostic plots for {dataset_name}...")
         
         X_processed = self._get_processed_features(X)
-        dmatrix = xgb.DMatrix(X_processed)
+        dmatrix = self.model_engine._create_categorical_aware_dmatrix(X_processed)
         predictions = self.model_engine.model.predict(dmatrix)
         
         self._create_censoring_aware_kde(y, events, f'{dataset_name}_survival_times')
