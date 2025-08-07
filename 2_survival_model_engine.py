@@ -36,7 +36,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class AFTParameters:
     """AFT model parameters with distribution-specific configuration"""
-    eta: np.ndarray
     sigma: float
     distribution: str
     log_likelihood: float
@@ -355,15 +354,20 @@ class SmartFeatureProcessor:
                 if cat_feature in df_encoded.columns:
                     # Get categories from all datasets if first time processing
                     if cat_feature not in self.label_encoders:
+                        # Use only training dataset (or first dataset if 'train' not available) for categorical encoding to prevent data leakage
+                        reference_df = datasets.get('train', list(datasets.values())[0])
+                        if reference_df is None:
+                            # Fallback to first dataset if 'train' not available
+                            reference_df = list(processed_datasets.values())[0]
+                            logger.warning("No 'train' dataset found, using first dataset for categorical encoding")
+                        
                         all_categories = set()
-                        for other_df in processed_datasets.values():
-                            if cat_feature in other_df.columns:
-                                cats = other_df[cat_feature].fillna('MISSING').astype(str).unique()
-                                all_categories.update(cats)
+                        if cat_feature in reference_df.columns:
+                            cats = reference_df[cat_feature].fillna('MISSING').astype(str).unique()
+                            all_categories.update(cats)
                         
                         # Remove alphabetical ordering - use frequency-based ordering instead
                         # Get frequency from training dataset (or first dataset if 'train' not available)
-                        reference_df = datasets.get('train', list(datasets.values())[0])
                         if cat_feature in reference_df.columns:
                             # Order by frequency (most frequent gets lower codes)
                             freq_order = reference_df[cat_feature].fillna('MISSING').astype(str).value_counts()
@@ -376,10 +380,15 @@ class SmartFeatureProcessor:
                             # Fallback to sorted if reference not available
                             ordered_categories = sorted(all_categories)
                         
-                        # MODIFIED: Use frequency-based ordering instead of alphabetical
-                        self.label_encoders[cat_feature] = {
-                            cat: idx for idx, cat in enumerate(ordered_categories)
-                        }
+                        # Reserve code 0 for unknown categories during inference
+                        UNKNOWN_CODE = 0
+                        
+                        # Frequency-based encoding starting from 1, with explicit unknown handling
+                        self.label_encoders[cat_feature] = {}
+                        self.label_encoders[cat_feature]['UNKNOWN'] = UNKNOWN_CODE
+                        
+                        for idx, cat in enumerate(ordered_categories):
+                            self.label_encoders[cat_feature][cat] = idx + 1
                     
                     # Apply encoding
                     encoded_col = f'{cat_feature}_encoded'
@@ -467,11 +476,11 @@ class SurvivalModelEngine:
                 # Uncensored: f(t) = f(z) / (sigma * t)
                 # Note: log(1/sigma) term cancels in relative comparison
                 if distribution == 'normal':
-                    log_prob = stats.norm.logpdf(z_lower)
+                    log_prob = stats.norm.logpdf(z_lower) - np.log(scale)
                 elif distribution == 'logistic':
-                    log_prob = z_lower - 2 * np.log1p(np.exp(z_lower))
+                    log_prob = z_lower - 2 * np.log1p(np.exp(z_lower)) - np.log(scale)
                 elif distribution == 'extreme':
-                    log_prob = z_lower - np.exp(z_lower)
+                    log_prob = z_lower - np.exp(z_lower) - np.log(scale)
                 else:
                     raise ValueError(f"Unsupported distribution: {distribution}")
             
@@ -571,7 +580,6 @@ class SurvivalModelEngine:
                             'distribution': distribution,
                             'scale': scale,
                             'log_likelihood': log_likelihood,
-                            'eta_predictions': eta_predictions
                         }
                         
                 except Exception as e:
@@ -587,7 +595,6 @@ class SurvivalModelEngine:
                 f"scale={best_params['scale']:.4f}, log-likelihood={best_log_likelihood:.4f}")
         
         return AFTParameters(
-            eta=best_params['eta_predictions'],
             sigma=best_params['scale'],
             distribution=best_params['distribution'],
             log_likelihood=best_log_likelihood,
@@ -963,15 +970,9 @@ class SurvivalModelEngine:
                 encoded_col = f'{cat_feature}_encoded'
                 cats = X_processed[cat_feature].fillna('MISSING').astype(str)
                 
-                # Add explicit unknown category code instead of arbitrary 0
-                max_known_code = max(mapping.values()) if mapping else 0
-                unknown_code = max_known_code + 1
-                
-                # Store unknown code for consistency
-                if 'UNKNOWN' not in mapping:
-                    mapping['UNKNOWN'] = unknown_code
-                
-                X_processed[encoded_col] = cats.map(mapping).fillna(unknown_code)  # Use explicit unknown code
+                # Use consistent unknown code (0) established during training
+                unknown_code = mapping.get('UNKNOWN', 0)
+                X_processed[encoded_col] = cats.map(mapping).fillna(unknown_code)
         
         # Select final features
         available_features = [col for col in self.feature_columns if col in X_processed.columns]
@@ -1059,7 +1060,6 @@ class SurvivalModelEngine:
                 # Restore AFT parameters
                 aft_data = metadata['aft_parameters']
                 self.aft_parameters = AFTParameters(
-                    eta=np.array([]),  # Will be generated during prediction
                     sigma=aft_data['sigma'],
                     distribution=aft_data['distribution'],
                     log_likelihood=aft_data['log_likelihood']

@@ -137,12 +137,8 @@ class SurvivalEvaluation:
                     encoded_col = f'{cat_feature}_encoded'
                     cats = X_processed[cat_feature].fillna('MISSING').astype(str)
                     
-                    # Use updated unknown category handling
-                    max_known_code = max(mapping.values()) if mapping else 0
-                    unknown_code = max_known_code + 1
-                    if 'UNKNOWN' not in mapping:
-                        mapping['UNKNOWN'] = unknown_code
-                        
+                    # Use consistent unknown handling matching training approach
+                    unknown_code = mapping.get('UNKNOWN', 0)
                     X_processed[encoded_col] = cats.map(mapping).fillna(unknown_code)
         
         # Select final features
