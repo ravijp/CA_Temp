@@ -59,11 +59,11 @@ class ModelResults:
 class ModelConfig:
     """Core modeling configuration with optimized XGBoost parameters"""
     aft_distributions: List[str] = field(default_factory=lambda: ['normal', 'logistic', 'extreme'])
-    scale_parameter_range: Tuple[float, float] = (0.1, 5.0)
-    scale_parameter_grid_size: int = 20
+    scale_parameter_range: Tuple[float, float] = (0.1, 6.0)
+    scale_parameter_grid_size: int = 100
     validation_metrics: List[str] = field(default_factory=lambda: ['c_index', 'ibs', 'gini', 'ece'])
     xgb_params: Dict[str, Any] = field(default_factory=lambda: {
-        'max_depth': 3,
+        'max_depth': 5,
         'eta': 0.01,
         'subsample': 0.9,
         'colsample_bytree': 0.9,
@@ -422,16 +422,19 @@ class SmartFeatureProcessor:
 class SurvivalModelEngine:
     """Advanced AFT survival modeling engine with smart feature processing and multi-dataset support"""
     
-    def __init__(self, config: ModelConfig, feature_processor: SmartFeatureProcessor):
-        """Initialize with configuration and smart feature processing component"""
+    def __init__(self, config: ModelConfig, feature_processor: SmartFeatureProcessor, 
+                 aft_parameters: AFTParameters = None):
+        """Initialize with configuration and optional pre-computed AFT parameters"""
         self.config = config
         self.feature_processor = feature_processor
         self.model = None
-        self.aft_parameters = None
+        self.aft_parameters = aft_parameters  # External parameters if provided
         self.feature_columns = None
         self.training_metadata = {}
         
         logger.info(f"SurvivalModelEngine initialized with {len(config.aft_distributions)} AFT distributions")
+        if aft_parameters:
+            logger.info(f"Using pre-computed AFT parameters: {aft_parameters.distribution}, σ={aft_parameters.sigma:.4f}")
     
     def _calculate_manual_log_likelihood(self, predictions: np.ndarray, actuals: np.ndarray, 
                                     events: np.ndarray, distribution: str, scale: float) -> float:
@@ -684,18 +687,20 @@ class SurvivalModelEngine:
         
         # Step 4: Optimize AFT parameters using train and val
         if 'train' in model_datasets and 'val' in model_datasets:
-            optimal_params = self.optimize_aft_parameters(
-                model_datasets['train'], model_datasets['val']
-            )
+            if self.aft_parameters is None:
+                # Step 4: Optimize AFT parameters using train and val
+                optimal_params = self.optimize_aft_parameters(model_datasets['train'], model_datasets['val'])
+                self.aft_parameters = optimal_params
+            else:
+                logger.info("Using pre-provided AFT parameters, skipping optimization")
         else:
-            # Use first two datasets if train/val not specified
-            dataset_names = list(model_datasets.keys())
-            optimal_params = self.optimize_aft_parameters(
-                model_datasets[dataset_names[0]], model_datasets[dataset_names[1]]
-            )
-        
-        self.aft_parameters = optimal_params
-        
+            # # Use first two datasets if train/val not specified
+            # dataset_names = list(model_datasets.keys())
+            # optimal_params = self.optimize_aft_parameters(
+            #     model_datasets[dataset_names[0]], model_datasets[dataset_names[1]]
+            # )
+            pass
+                
         # Step 5: Train final model with all datasets for evaluation
         final_model, evals_result = self._train_final_model(model_datasets, optimal_params)
         self.model = final_model
@@ -1123,6 +1128,9 @@ if __name__ == "__main__":
     
     # Initialize feature processor
     feature_processor = SmartFeatureProcessor(feature_config)
+    
+    # external_params = AFTParameters(sigma=2.5, distribution='normal', log_likelihood=-1234.5)
+    # engine = SurvivalModelEngine(model_config, feature_processor, aft_parameters=external_params)
     engine = SurvivalModelEngine(model_config, feature_processor)
     
     print("✓ Configuration and components initialized")
