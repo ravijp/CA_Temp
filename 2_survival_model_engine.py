@@ -488,14 +488,14 @@ class SurvivalModelEngine:
         
         return np.sum(log_likelihood_terms)
 
-    def _create_categorical_aware_dmatrix(self, X_processed: pd.DataFrame, label=None) -> xgb.DMatrix:
+    def _create_categorical_aware_dmatrix(self, X_processed: pd.DataFrame, label=None, enable_categorical: bool = True) -> xgb.DMatrix:
         """Create DMatrix with proper categorical feature type information"""
         
         # Create DMatrix with categorical support
         dmatrix = xgb.DMatrix(X_processed, enable_categorical=True)
         
         # Set feature types for XGBoost 3.0.2 native categorical handling
-        if hasattr(self.model_engine, 'feature_columns') and self.model_engine.feature_columns:
+        if enable_categorical and hasattr(self, 'feature_columns') and self.feature_columns:
             feature_types = []
             for col in X_processed.columns:
                 if col.endswith('_encoded'):  # Our categorical features
