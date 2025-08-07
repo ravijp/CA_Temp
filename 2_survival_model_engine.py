@@ -361,8 +361,24 @@ class SmartFeatureProcessor:
                                 cats = other_df[cat_feature].fillna('MISSING').astype(str).unique()
                                 all_categories.update(cats)
                         
+                        # Remove alphabetical ordering - use frequency-based ordering instead
+                        # Get frequency from training dataset (or first dataset if 'train' not available)
+                        reference_df = datasets.get('train', list(datasets.values())[0])
+                        if cat_feature in reference_df.columns:
+                            # Order by frequency (most frequent gets lower codes)
+                            freq_order = reference_df[cat_feature].fillna('MISSING').astype(str).value_counts()
+                            ordered_categories = freq_order.index.tolist()
+                            
+                            # Add any categories not in reference dataset
+                            missing_cats = all_categories - set(ordered_categories)
+                            ordered_categories.extend(sorted(missing_cats))  # Only sort the missing ones
+                        else:
+                            # Fallback to sorted if reference not available
+                            ordered_categories = sorted(all_categories)
+                        
+                        # MODIFIED: Use frequency-based ordering instead of alphabetical
                         self.label_encoders[cat_feature] = {
-                            cat: idx for idx, cat in enumerate(sorted(all_categories))
+                            cat: idx for idx, cat in enumerate(ordered_categories)
                         }
                     
                     # Apply encoding
@@ -472,6 +488,25 @@ class SurvivalModelEngine:
         
         return np.sum(log_likelihood_terms)
 
+    def _create_categorical_aware_dmatrix(self, X_processed: pd.DataFrame, label=None) -> xgb.DMatrix:
+        """Create DMatrix with proper categorical feature type information"""
+        
+        # Create DMatrix with categorical support
+        dmatrix = xgb.DMatrix(X_processed, enable_categorical=True)
+        
+        # Set feature types for XGBoost 3.0.2 native categorical handling
+        if hasattr(self.model_engine, 'feature_columns') and self.model_engine.feature_columns:
+            feature_types = []
+            for col in X_processed.columns:
+                if col.endswith('_encoded'):  # Our categorical features
+                    feature_types.append('c')  # Categorical
+                else:
+                    feature_types.append('q')  # Quantitative
+            
+            dmatrix.set_info(feature_types=feature_types)
+        
+        return dmatrix 
+
     def optimize_aft_parameters(self, train_data: Tuple, val_data: Tuple) -> AFTParameters:
         """
         MLE-based AFT parameter optimization across distributions for XGBoost 3.0+
@@ -515,7 +550,7 @@ class SurvivalModelEngine:
                                                         distribution, scale)
                     
                     # Get predictions for validation set
-                    dval = xgb.DMatrix(X_val)
+                    dval = self._create_categorical_aware_dmatrix(X_val)
                     eta_predictions = temp_model.predict(dval)
                     
                     # Calculate manual log-likelihood on validation set
@@ -568,7 +603,7 @@ class SurvivalModelEngine:
         y_upper = np.where(events == 1, y_log.values, np.inf)
         
         # Create DMatrix with interval bounds
-        dtrain = xgb.DMatrix(X)
+        dtrain = self._create_categorical_aware_dmatrix(X)
         dtrain.set_float_info('label_lower_bound', y_lower)
         dtrain.set_float_info('label_upper_bound', y_upper)
         
@@ -578,7 +613,9 @@ class SurvivalModelEngine:
             'objective': 'survival:aft',
             'eval_metric': 'aft-nloglik',
             'aft_loss_distribution': distribution,
-            'aft_loss_distribution_scale': scale
+            'aft_loss_distribution_scale': scale,
+            'enable_categorical': True,  # Enable categorical support
+            'max_cat_to_onehot': 4       # Optimize categorical handling
         })
         
         # Train with reduced iterations for optimization speed
@@ -693,6 +730,13 @@ class SurvivalModelEngine:
         
         # Create DMatrix for all datasets
         dmatrices = {}
+        
+        categorical_indices = []
+        if self.feature_columns:
+            for i, col in enumerate(self.feature_columns):
+                if col.endswith('_encoded'):  # These are our categorical features
+                    categorical_indices.append(i)
+        
         for name, (X, y, events) in model_datasets.items():
             # Apply log transformation for AFT
             y_log = np.log(y)
@@ -701,10 +745,10 @@ class SurvivalModelEngine:
             y_lower = y_log.values
             y_upper = np.where(events == 1, y_log.values, np.inf)
             
-            dmatrix = xgb.DMatrix(X, label=y_log)
+            dmatrix = self._create_categorical_aware_dmatrix(X, label=y_log)
             dmatrix.set_float_info('label_lower_bound', y_lower)
             dmatrix.set_float_info('label_upper_bound', y_upper)
-            
+                        
             dmatrices[name] = dmatrix
         
         # Set final AFT parameters
@@ -713,7 +757,9 @@ class SurvivalModelEngine:
             'objective': 'survival:aft',
             'eval_metric': 'aft-nloglik',
             'aft_loss_distribution': aft_params.distribution,
-            'aft_loss_distribution_scale': aft_params.sigma
+            'aft_loss_distribution_scale': aft_params.sigma,
+            'enable_categorical': True,  # Enable native categorical support
+            'max_cat_to_onehot': 4       # One-hot encode if ≤4 categories, else use optimal splits
         })
         
         # Prepare evaluation sets
@@ -742,7 +788,7 @@ class SurvivalModelEngine:
         for name, (X, y, events) in model_datasets.items():
             try:
                 # Get predictions
-                dmatrix = xgb.DMatrix(X)
+                dmatrix = self._create_categorical_aware_dmatrix(X)
                 predictions = model.predict(dmatrix)
                 
                 # Calculate metrics
@@ -826,7 +872,7 @@ class SurvivalModelEngine:
         X_processed = self._get_processed_features(X)
         
         # Get AFT predictions (eta)
-        dmatrix = xgb.DMatrix(X_processed)
+        dmatrix = self._create_categorical_aware_dmatrix(X_processed)
         eta_predictions = self.model.predict(dmatrix)
         
         logger.info(f"Generating survival curves for {len(X)} samples over {len(time_points)} time points")
@@ -887,7 +933,7 @@ class SurvivalModelEngine:
         X_processed = self._get_processed_features(X)
         
         # Get AFT predictions
-        dmatrix = xgb.DMatrix(X_processed)
+        dmatrix = self._create_categorical_aware_dmatrix(X_processed)
         eta_predictions = self.model.predict(dmatrix)
         
         # Convert to risk scores (lower predicted survival time = higher risk)
@@ -916,7 +962,16 @@ class SurvivalModelEngine:
             if cat_feature in X_processed.columns:
                 encoded_col = f'{cat_feature}_encoded'
                 cats = X_processed[cat_feature].fillna('MISSING').astype(str)
-                X_processed[encoded_col] = cats.map(mapping).fillna(0)  # Unknown categories get 0
+                
+                # Add explicit unknown category code instead of arbitrary 0
+                max_known_code = max(mapping.values()) if mapping else 0
+                unknown_code = max_known_code + 1
+                
+                # Store unknown code for consistency
+                if 'UNKNOWN' not in mapping:
+                    mapping['UNKNOWN'] = unknown_code
+                
+                X_processed[encoded_col] = cats.map(mapping).fillna(unknown_code)  # Use explicit unknown code
         
         # Select final features
         available_features = [col for col in self.feature_columns if col in X_processed.columns]
