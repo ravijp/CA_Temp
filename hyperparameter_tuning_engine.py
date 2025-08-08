@@ -12,8 +12,18 @@ Features:
 - Comprehensive checkpointing and resume capability
 - Production-ready error handling and monitoring
 
-Author: ML Engineering Team
-Version: 1.0.0
+Performance Metrics You'll Get:
+    - AFT Negative Log-Likelihood: Primary metric (lower is better)
+    - C-Index: Concordance index, like accuracy for survival models (higher is better, 0.5-1.0 range)
+    - Calibration Slope: How well predictions match reality (closer to 1.0 is better)
+
+72 trials (40%) focus specifically on the "scale parameter" - this controls how spread out the predictions are
+108 trials (60%) test all parameters together - this includes learning rates, tree depth, regularization, and other technical settings
+
+First 20 trials: Random exploration to understand the search space
+Next 52 trials: Focus on scale parameter with simplified other settings
+Final 108 trials: Joint optimization of all parameters using knowledge from earlier trials
+
 """
 
 import numpy as np
