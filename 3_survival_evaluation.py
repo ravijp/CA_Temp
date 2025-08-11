@@ -862,8 +862,8 @@ class SurvivalEvaluation:
     def _get_survival_probabilities_at_time(self, predictions: np.ndarray, time: int) -> np.ndarray:
         """Get survival probabilities at specific time point"""
         # Use AFT formulation to calculate survival at time t
-        sigma = self.model_engine.model_parameters.sigma
-        distribution = self.model_engine.model_parameters.distribution
+        sigma = self.model_engine.aft_parameters.sigma
+        distribution = self.model_engine.aft_parameters.distribution
         
         log_time = np.log(time)
         z_scores = (log_time - predictions) / sigma
