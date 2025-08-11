@@ -11,7 +11,8 @@ from top_etl.feature_engg.constants import (
     FEATURE_GROUPS,
     FEATURE_VALIDATION_RULES,
     BUSINESS_LOGIC_THRESHOLDS,
-    DATA_QUALITY_THRESHOLDS
+    DATA_QUALITY_THRESHOLDS,
+    CRITICAL_FEATURES
 )
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,7 @@ class FeatureEDD:
         Returns:
             Dictionary containing comprehensive EDD results
         """
-        logger.info("🔍 Starting comprehensive feature EDD generation...")
+        logger.info("Starting comprehensive feature EDD generation...")
         
         try:
             edd_results = {
@@ -51,11 +52,11 @@ class FeatureEDD:
             # Generate summary report
             self._print_edd_summary(edd_results)
             
-            logger.info("✅ Feature EDD generation completed successfully")
+            logger.info("Feature EDD generation completed successfully")
             return edd_results
             
         except Exception as e:
-            logger.error(f"❌ Feature EDD generation failed: {e}")
+            logger.error(f"Feature EDD generation failed: {e}")
             return {}
 
     def _get_dataset_overview(self, df: DataFrame) -> Dict:
@@ -520,12 +521,12 @@ class FeatureEDD:
         """Print comprehensive EDD summary"""
         try:
             print("\n" + "="*80)
-            print("📊 COMPREHENSIVE FEATURE EDD SUMMARY")
+            print("COMPREHENSIVE FEATURE EDD SUMMARY")
             print("="*80)
             
             # Dataset Overview
             overview = edd_results.get("dataset_overview", {})
-            print(f"\n📈 DATASET OVERVIEW:")
+            print(f"\nDATASET OVERVIEW:")
             print(f"  Total Records: {overview.get('total_records', 0):,}")
             print(f"  Total Features: {overview.get('total_features', 0)}")
             print(f"  Unique Persons: {overview.get('unique_persons', 0):,}")
@@ -538,15 +539,15 @@ class FeatureEDD:
             
             # Feature Group Analysis
             group_analysis = edd_results.get("feature_group_analysis", {})
-            print(f"\n🎯 FEATURE GROUP COVERAGE:")
+            print(f"\nFEATURE GROUP COVERAGE:")
             for group_name, group_info in group_analysis.items():
                 coverage = group_info.get("coverage_percentage", 0)
                 available = group_info.get("available", 0)
                 total = group_info.get("total_expected", 0)
                 avg_null = group_info.get("avg_null_rate", 0)
                 
-                status = "✅" if coverage >= 80 else "⚠️" if coverage >= 60 else "❌"
-                print(f"  {status} {group_name}: {available}/{total} features ({coverage:.1f}%) - Avg Null: {avg_null:.1f}%")
+                status = "PASS" if coverage >= 80 else "WARN" if coverage >= 60 else "FAIL"
+                print(f"  [{status}] {group_name}: {available}/{total} features ({coverage:.1f}%) - Avg Null: {avg_null:.1f}%")
                 
                 if group_info.get("missing_features"):
                     missing = group_info["missing_features"][:3]  # Show first 3
@@ -558,7 +559,7 @@ class FeatureEDD:
             
             # Data Quality Summary
             quality = edd_results.get("data_quality_metrics", {})
-            print(f"\n🔍 DATA QUALITY SUMMARY:")
+            print(f"\nDATA QUALITY SUMMARY:")
             print(f"  Overall Null Rate: {quality.get('overall_null_rate', 0):.2f}%")
             print(f"  Quality Score: {quality.get('quality_score', 0):.1f}/100")
             
@@ -572,12 +573,12 @@ class FeatureEDD:
             
             # Business Logic Issues
             business_logic = edd_results.get("business_logic_checks", {})
-            print(f"\n⚖️ BUSINESS LOGIC VALIDATION:")
+            print(f"\nBUSINESS LOGIC VALIDATION:")
             total_issues = sum(v for v in business_logic.values() if isinstance(v, int))
             if total_issues == 0:
-                print("  ✅ No business logic violations detected")
+                print("  [PASS] No business logic violations detected")
             else:
-                print(f"  ⚠️ Found {total_issues:,} business logic issues:")
+                print(f"  [WARN] Found {total_issues:,} business logic issues:")
                 for check, count in business_logic.items():
                     if isinstance(count, int) and count > 0:
                         print(f"    {check}: {count:,} records")
@@ -586,9 +587,9 @@ class FeatureEDD:
             correlations = edd_results.get("correlation_analysis", {})
             high_corr_count = correlations.get("high_correlation_count", 0)
             if high_corr_count > 0:
-                print(f"\n🔗 HIGH CORRELATIONS DETECTED: {high_corr_count}")
+                print(f"\nHIGH CORRELATIONS DETECTED: {high_corr_count}")
                 for corr in correlations.get("high_correlations", [])[:5]:
-                    print(f"    {corr['feature1']} ↔ {corr['feature2']}: {corr['correlation']:.3f}")
+                    print(f"    {corr['feature1']} <-> {corr['feature2']}: {corr['correlation']:.3f}")
             
             print("\n" + "="*80)
             

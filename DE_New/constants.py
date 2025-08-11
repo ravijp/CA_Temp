@@ -33,7 +33,35 @@ EVENT_CODE_MAPPINGS = {
     "nonexempt_to_exempt": ["NEX", "NXX"]
 }
 
-# Feature validation rules
+# Individual event reason mappings for backward compatibility
+OUTSTANDING_PERFORMANCE_REASONS = EVENT_CODE_MAPPINGS["performance"]
+TITLE_CHANGE_REASONS = EVENT_CODE_MAPPINGS["title_change"]
+MARKET_ADJUSTMENT_REASONS = EVENT_CODE_MAPPINGS["market_adjustment"]
+COMPANY_REORG_REASONS = EVENT_CODE_MAPPINGS["company_reorg"]
+PERFORMANCE_ISSUE_REASONS = EVENT_CODE_MAPPINGS["performance_issues"]
+EMPLOYEE_REQUEST_REASONS = EVENT_CODE_MAPPINGS["employee_request"]
+RELOCATION_REASONS = EVENT_CODE_MAPPINGS["relocation"]
+ASSIGNMENT_REASONS = EVENT_CODE_MAPPINGS["assignment"]
+FT_TO_PT_REASONS = EVENT_CODE_MAPPINGS["ft_to_pt"]
+NON_EXEMPT_TO_EXEMPT_REASONS = EVENT_CODE_MAPPINGS["nonexempt_to_exempt"]
+
+# External data configuration
+EXTERNAL_DATA_CONFIG = {
+    "state_to_region_file": "US_State_to_Region_Mapping.csv",
+    "cpi_data_file": "US_CPI_Change_By_Regions.csv", 
+    "flsa_mapping_file": "flsa_client_mapping.csv",
+    "census_income_file": "US_Census_Median_Income.csv",
+    "fallback_values": {
+        "sal_cpi_rt_ratio_1yr": 0.0,
+        "sal_nghb_ratio": 0.0,
+        "flsa_status_desc": "others"
+    }
+}
+
+# Data directory path
+DATA_DIR_PATH = "/Volumes/onedata_us_east_1_shared_prod/datacloud_raw_oneai_turnoverprobability_prod/datacloud_raw_oneai_turnoverprobability_prod-volume"
+
+# Feature validation rules - UPDATED: Removed company_layoff_indicator and total_compensation_growth
 FEATURE_VALIDATION_RULES = {
     # Compensation features
     "baseline_salary": {"min": 0, "max": 1000000, "allow_null": False},
@@ -42,24 +70,27 @@ FEATURE_VALIDATION_RULES = {
     "compensation_percentile_industry": {"min": 0.0, "max": 1.0, "allow_null": True},
     "compensation_volatility": {"min": 0.0, "max": None, "allow_null": True},
     "pay_grade_stagnation_months": {"min": 0, "max": 600, "allow_null": True},
-    "total_compensation_growth": {"min": -1.0, "max": 5.0, "allow_null": True},
     "pay_frequency_preference": {"min": 0, "max": 2, "allow_null": False},
+    "comp_chang_freq_per_year": {"min": 0.0, "max": 24.0, "allow_null": True},
     "avg_salary_last_quarter": {"min": 0, "max": None, "allow_null": True},
     "pay_freq_consistency_score": {"min": 0.0, "max": 1.0, "allow_null": True},
     
-    # Career progression features
+    # Career progression features - event-based
     "time_since_last_promotion": {"min": 0, "max": 10000, "allow_null": True},
     "promotion_velocity": {"min": 0.0, "max": None, "allow_null": True},
     "promot_2yr_ind": {"min": 0, "max": 1, "allow_null": False},
     "demot_2yr_ind": {"min": 0, "max": 1, "allow_null": False},
+    "transfer_2yr_ind": {"min": 0, "max": 1, "allow_null": False},
     "num_promot_2yr": {"min": 0, "max": 20, "allow_null": False},
     "num_demot_2yr": {"min": 0, "max": 20, "allow_null": False},
+    "num_transfer_2yr": {"min": 0, "max": 20, "allow_null": False},
     "promot_2yr_perf_ind": {"min": 0, "max": 1, "allow_null": False},
     "promot_2yr_titlechng_ind": {"min": 0, "max": 1, "allow_null": False},
     "promot_2yr_mktadjst_ind": {"min": 0, "max": 1, "allow_null": False},
     "demot_2yr_compreorg_ind": {"min": 0, "max": 1, "allow_null": False},
     "demot_2yr_perfissue_ind": {"min": 0, "max": 1, "allow_null": False},
     "days_since_promot": {"min": 0, "max": 10000, "allow_null": True},
+    "days_since_transfer": {"min": 0, "max": 10000, "allow_null": True},
     "promot_veloc": {"min": 0.0, "max": None, "allow_null": True},
     "promot_rt": {"min": 0.0, "max": 1.0, "allow_null": True},
     
@@ -87,29 +118,24 @@ FEATURE_VALIDATION_RULES = {
     
     # Team environment
     "team_size": {"min": 1, "max": 1000, "allow_null": True},
-    "team_turnover_rate_12m": {"min": 0.0, "max": 1.0, "allow_null": True},
-    "team_avg_tenure": {"min": 0, "max": 20000, "allow_null": True},
+    "team_turnover_rate": {"min": 0.0, "max": 1.0, "allow_null": True},
+    "team_avg_tnur_days": {"min": 0, "max": 20000, "allow_null": True},
     "peer_salary_ratio": {"min": 0.1, "max": 10.0, "allow_null": True},
     "team_avg_comp": {"min": 0, "max": None, "allow_null": True},
-    "team_turnover_rate": {"min": 0.0, "max": 1.0, "allow_null": True},
     
     # Tenure dynamics
     "tenure_at_vantage_days": {"min": 0, "max": 20000, "allow_null": False},
     "tenure_in_current_role": {"min": 0, "max": 20000, "allow_null": True},
-    "company_tenure_percentile": {"min": 1, "max": 99, "allow_null": True},
+    "company_tenure_percentile": {"min": 1, "max": 100, "allow_null": True},
     
     # Work patterns
     "assignment_frequency_12m": {"min": 0, "max": 50, "allow_null": False},
     "work_location_changes_count": {"min": 0, "max": 20, "allow_null": False},
     "num_city_chng": {"min": 0, "max": 20, "allow_null": False},
-    "num_state_chng": {"min": 0, "max": 20, "allow_null": False},
-    "days_since_transfer": {"min": 0, "max": 10000, "allow_null": True},
-    "transfer_2yr_ind": {"min": 0, "max": 1, "allow_null": False},
-    "num_transfer_2yr": {"min": 0, "max": 20, "allow_null": False},
+    "num_state_chng": {"min": 0, "max": 10, "allow_null": False},
     
-    # Company factors
+    # Company factors - REMOVED: company_layoff_indicator
     "company_size_tier": {"values": ["Small", "Medium", "Large", "Enterprise", "Unknown"], "allow_null": False},
-    "company_layoff_indicator": {"min": 0, "max": 1, "allow_null": False},
     
     # Job change events
     "job_chng_2yr_ind": {"min": 0, "max": 1, "allow_null": False},
@@ -119,38 +145,13 @@ FEATURE_VALIDATION_RULES = {
     
     # External features
     "salary_growth_rate12m_to_cpi_rate": {"min": -10.0, "max": 10.0, "allow_null": True},
+    "flsa_status_desc": {"values": ["exempt", "non-exempt", "others"], "allow_null": True},
     "sal_nghb_ratio": {"min": 0.1, "max": 20.0, "allow_null": True},
     
     # Target variables
     "survival_time_days": {"min": 0, "max": 365, "allow_null": False},
     "event_indicator_all": {"min": 0, "max": 1, "allow_null": False},
     "event_indicator_vol": {"min": 0, "max": 1, "allow_null": False},
-}
-
-# External data configuration
-DATA_DIR_PATH = "/path/to/external/data"  # Update with actual path
-
-EXTERNAL_DATA_CONFIG = {
-    "state_to_region_file": "US_State_to_Region_Mapping.csv",
-    "cpi_by_region_file": "US_CPI_Change_By_Regions.csv",
-    "flsa_mapping_file": "flsa_client_mapping.csv",
-    "census_income_file": "US_Census_Median_Income.csv",
-}
-
-# Fallback values when external data is unavailable
-EXTERNAL_DATA_FALLBACKS = {
-    "default_cpi_ratio": 1.0,
-    "default_neighborhood_ratio": 1.0,
-    "default_flsa_desc": "others",
-    "default_region": "Unknown",
-    "default_median_income": 50000,
-}
-
-# Temporal consistency validation rules
-TEMPORAL_VALIDATION_RULES = {
-    "max_future_days": 0,  # No features should use future data
-    "required_temporal_columns": ["vantage_date"],
-    "event_date_columns": ["event_eff_dt", "rec_eff_start_dt_mod", "termination_date"],
 }
 
 # Business logic validation thresholds
@@ -161,9 +162,24 @@ BUSINESS_LOGIC_THRESHOLDS = {
     "max_salary": 1000000,
     "min_salary": 10000,
     "max_manager_span": 1000,
-    "max_promotion_velocity": 10.0,  # promotions per year
+    "max_promotion_velocity": 10.0,
     "max_job_changes_2yr": 20,
     "outlier_percentile": 99.5,
+}
+
+# Data quality thresholds
+DATA_QUALITY_THRESHOLDS = {
+    "max_null_percentage": 0.95,
+    "min_variance": 0.001,
+    "max_correlation": 0.99,
+    "outlier_std_threshold": 5,
+}
+
+# Temporal consistency validation rules
+TEMPORAL_VALIDATION_RULES = {
+    "max_future_days": 0,
+    "required_temporal_columns": ["vantage_date"],
+    "event_date_columns": ["event_eff_dt", "rec_eff_start_dt_mod", "termination_date"],
 }
 
 BASE_COLS = [
@@ -178,16 +194,15 @@ BASE_COLS = [
     "position", "cpi_2023",
 ]
 
+# UPDATED: Removed total_compensation_growth and company_layoff_indicator
 SELECT_FEATURE_COLS = [
     # Compensation features
     "baseline_salary", "salary_growth_rate_12m", "compensation_percentile_company", "compensation_percentile_industry",
-    "compensation_volatility", "pay_grade_stagnation_months", "total_compensation_growth", "pay_frequency_preference",
-    "avg_salary_last_quarter", "pay_freq_consistency_score",
+    "compensation_volatility", "pay_grade_stagnation_months", "pay_frequency_preference",
+    "comp_chang_freq_per_year", "avg_salary_last_quarter", "pay_freq_consistency_score",
     
-    # Career progression features
+    # Career progression features - event-based
     "time_since_last_promotion", "promotion_velocity",
-    
-    # Event-based career features
     "promot_2yr_ind", "demot_2yr_ind", "transfer_2yr_ind", "num_promot_2yr", "num_demot_2yr", "num_transfer_2yr",
     "promot_2yr_perf_ind", "promot_2yr_titlechng_ind", "promot_2yr_mktadjst_ind", 
     "demot_2yr_compreorg_ind", "demot_2yr_perfissue_ind", "days_since_promot", "days_since_transfer",
@@ -199,13 +214,13 @@ SELECT_FEATURE_COLS = [
     
     # Job characteristics
     "job_level", "job_family_turnover_rate", "flsa_stus_cd", "full_tm_part_tm_cd", "reg_temp_cd", "role_complexity_score",
-    "job_stability_ind",
+    "job_stability_ind", "flsa_status_desc",
     
     # Manager environment
     "time_with_current_manager", "manager_tenure_days", "manager_span_control", "manager_changes_count", "is_manager_ind",
     
     # Team environment
-    "team_size", "team_turnover_rate_12m", "team_avg_tenure", "peer_salary_ratio", "team_avg_comp", "team_turnover_rate",
+    "team_size", "team_turnover_rate", "team_avg_tnur_days", "peer_salary_ratio", "team_avg_comp",
     
     # Tenure dynamics
     "tenure_at_vantage_days", "tenure_in_current_role", "company_tenure_percentile",
@@ -213,8 +228,8 @@ SELECT_FEATURE_COLS = [
     # Work patterns
     "assignment_frequency_12m", "work_location_changes_count", "num_city_chng", "num_state_chng",
     
-    # Company factors
-    "naics_cd", "company_size_tier", "company_layoff_indicator", "fscl_actv_ind",
+    # Company factors - REMOVED: company_layoff_indicator
+    "naics_cd", "company_size_tier", "fscl_actv_ind",
     
     # Temporal features
     "hire_date_seasonality", "fiscal_year_effect", "quarter_effect",
@@ -223,33 +238,22 @@ SELECT_FEATURE_COLS = [
     "job_chng_2yr_ind", "num_job_chng_2yr", "job_chng_fulltopart_ind", "job_chng_nexmptoexmp_ind",
     
     # External features
-    "salary_growth_rate12m_to_cpi_rate", "flsa_status_desc", "sal_nghb_ratio",
+    "salary_growth_rate12m_to_cpi_rate", "sal_nghb_ratio",
     
     # Target variables
     "survival_time_days", "event_indicator_all", "event_indicator_vol",
 ]
 
-RAW_COLS = [f"{col}{RAW_COLUMN_SUFFIX}" for col in RAW_TO_NORMALIZED_MAPPING]
-
-FINAL_COLS = list(set(BASE_COLS).union(set(SELECT_FEATURE_COLS)).union(set(RAW_COLS)))
-
-# Sample IDs for testing (placeholder)
-SAMPLE_IDS = []
-
-# Table names
-ONEDATA_CATALOG_NM = "onedata_us_east_1_shared_prod"
-TOP_SCHEMA_NM = "datacloud_raw_oneai_turnoverprobability_prod"
-
-# Feature groups for organized processing
+# Feature groups for organized validation and analysis - UPDATED: Removed company_layoff_indicator and total_compensation_growth
 FEATURE_GROUPS = {
     "compensation": [
         "baseline_salary", "salary_growth_rate_12m", "compensation_percentile_company", 
         "compensation_percentile_industry", "compensation_volatility", "pay_grade_stagnation_months",
-        "total_compensation_growth", "pay_frequency_preference", "avg_salary_last_quarter", 
+        "pay_frequency_preference", "comp_chang_freq_per_year", "avg_salary_last_quarter",
         "pay_freq_consistency_score"
     ],
     "career_progression": [
-        "time_since_last_promotion", "promotion_velocity", "promot_2yr_ind", "demot_2yr_ind", 
+        "time_since_last_promotion", "promotion_velocity", "promot_2yr_ind", "demot_2yr_ind",
         "transfer_2yr_ind", "num_promot_2yr", "num_demot_2yr", "num_transfer_2yr",
         "promot_2yr_perf_ind", "promot_2yr_titlechng_ind", "promot_2yr_mktadjst_ind",
         "demot_2yr_compreorg_ind", "demot_2yr_perfissue_ind", "days_since_promot", 
@@ -261,15 +265,14 @@ FEATURE_GROUPS = {
     ],
     "job_characteristics": [
         "job_level", "job_family_turnover_rate", "flsa_stus_cd", "full_tm_part_tm_cd", 
-        "reg_temp_cd", "role_complexity_score", "job_stability_ind"
+        "reg_temp_cd", "role_complexity_score", "job_stability_ind", "flsa_status_desc"
     ],
     "manager_environment": [
         "time_with_current_manager", "manager_tenure_days", "manager_span_control", 
         "manager_changes_count", "is_manager_ind"
     ],
     "team_environment": [
-        "team_size", "team_turnover_rate_12m", "team_avg_tenure", "peer_salary_ratio", 
-        "team_avg_comp", "team_turnover_rate"
+        "team_size", "team_turnover_rate", "team_avg_tnur_days", "peer_salary_ratio", "team_avg_comp"
     ],
     "tenure_dynamics": [
         "tenure_at_vantage_days", "tenure_in_current_role", "company_tenure_percentile"
@@ -278,7 +281,7 @@ FEATURE_GROUPS = {
         "assignment_frequency_12m", "work_location_changes_count", "num_city_chng", "num_state_chng"
     ],
     "company_factors": [
-        "naics_cd", "company_size_tier", "company_layoff_indicator", "fscl_actv_ind"
+        "naics_cd", "company_size_tier", "fscl_actv_ind"
     ],
     "temporal": [
         "hire_date_seasonality", "fiscal_year_effect", "quarter_effect"
@@ -287,12 +290,16 @@ FEATURE_GROUPS = {
         "job_chng_2yr_ind", "num_job_chng_2yr", "job_chng_fulltopart_ind", "job_chng_nexmptoexmp_ind"
     ],
     "external": [
-        "salary_growth_rate12m_to_cpi_rate", "flsa_status_desc", "sal_nghb_ratio"
+        "salary_growth_rate12m_to_cpi_rate", "sal_nghb_ratio"
     ],
-    "target": [
+    "targets": [
         "survival_time_days", "event_indicator_all", "event_indicator_vol"
     ]
 }
+
+RAW_COLS = [f"{col}{RAW_COLUMN_SUFFIX}" for col in RAW_TO_NORMALIZED_MAPPING]
+
+FINAL_COLS = list(set(BASE_COLS).union(set(SELECT_FEATURE_COLS)).union(set(RAW_COLS)))
 
 # Critical features that must be present
 CRITICAL_FEATURES = [
@@ -300,22 +307,13 @@ CRITICAL_FEATURES = [
     "age_at_vantage", "job_level", "survival_time_days", "event_indicator_all"
 ]
 
-# Feature engineering configuration
-FEATURE_CONFIG = {
-    "promotion_lookback_days": 730,  # 2 years
-    "salary_history_days": 365,     # 1 year
-    "team_analysis_days": 730,      # 2 years for team turnover
-    "assignment_frequency_days": 365, # 1 year
-    "gap_fill_threshold_days": 30,
-    "max_manager_span": 1000,
-    "retirement_age": 85,
-    "working_age_start": 25,
-}
+# Sample IDs for development/testing
+SAMPLE_IDS = [
+    "wfncore_adp_util_12345_67890",
+    "evcore_adp_util_23456_78901", 
+    "vtgcore_adp_util_34567_89012"
+]
 
-# Data quality thresholds
-DATA_QUALITY_THRESHOLDS = {
-    "max_null_percentage": 0.95,  # Reject features with >95% nulls
-    "min_variance": 0.001,        # Reject features with minimal variance
-    "max_correlation": 0.99,      # Flag highly correlated features
-    "outlier_std_threshold": 5,   # Flag outliers beyond 5 standard deviations
-}
+# Table and catalog names
+ONEDATA_CATALOG_NM = "onedata_us_east_1_shared_prod"
+TOP_SCHEMA_NM = "datacloud_raw_oneai_turnoverprobability_prod"
