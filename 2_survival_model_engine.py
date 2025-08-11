@@ -132,10 +132,16 @@ class SmartFeatureProcessor:
         
         if original_col not in self.transformation_history:
             self.transformation_history[original_col] = []
-        self.transformation_history[original_col].append({
-            'transformation': transformation,
-            'result_column': transformed_col
-        })
+        
+        existing_transforms = [step['transformation'] for step in self.transformation_history[original_col]]
+        if transformation not in existing_transforms:
+            self.transformation_history[original_col].append({
+                'transformation': transformation,
+                'result_column': transformed_col
+            })
+            logger.debug(f"Recorded new transformation: {original_col} -> {transformation}")
+        else:
+            logger.debug(f"Skipped duplicate transformation: {original_col} -> {transformation}")
     
     def _should_apply_transformation(self, feature: str, transformation_type: str, existing_columns: List[str]) -> bool:
         """Smart logic to determine if transformation should be applied based on target feature availability"""
