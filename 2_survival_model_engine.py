@@ -643,6 +643,28 @@ class SurvivalModelEngine:
         
         return model
 
+    def _compute_risk_score_statistics(self, validation_data: Tuple):
+        """Compute population risk score statistics for consistent normalization"""
+        X_val, y_val, events_val = validation_data
+        
+        X_processed = self._get_processed_features(X_val)
+        dmatrix = self._create_categorical_aware_dmatrix(X_processed)
+        eta_predictions = self.model.predict(dmatrix)
+        
+        population_risk_scores = -eta_predictions
+        
+        self._risk_score_stats = {
+            'min': float(population_risk_scores.min()),
+            'max': float(population_risk_scores.max()),
+            'range': float(population_risk_scores.max() - population_risk_scores.min()),
+            'mean': float(population_risk_scores.mean()),
+            'std': float(population_risk_scores.std()),
+            'computed_on': 'validation'
+        }
+        
+        logger.info(f"Risk score statistics computed: range=[{self._risk_score_stats['min']:.3f}, {self._risk_score_stats['max']:.3f}]")
+
+
     def train_survival_model(self, datasets: Dict[str, Tuple[pd.DataFrame, str, str]]) -> ModelResults:
         """
         Complete AFT model training pipeline with flexible multi-dataset handling
@@ -717,6 +739,13 @@ class SurvivalModelEngine:
         # Step 7: Feature importance with original names
         feature_importance = self._extract_feature_importance_with_names(final_model)
         
+        if 'val' in model_datasets:
+            self._compute_risk_score_statistics(model_datasets['val'])
+        else:
+            # Fallback to first available dataset
+            first_dataset = list(model_datasets.values())[0]
+            self._compute_risk_score_statistics(first_dataset)
+        
         # Step 8: Store training metadata
         self.training_metadata = {
             'dataset_shapes': {name: data[0].shape for name, data in model_datasets.items()},
@@ -742,7 +771,7 @@ class SurvivalModelEngine:
         )
         
         return results
-    
+        
     def _train_final_model(self, model_datasets: Dict[str, Tuple], aft_params: AFTParameters) -> Tuple[xgb.Booster, Dict]:
         """Train final model with optimal parameters and multi-dataset evaluation"""
         
@@ -947,6 +976,9 @@ class SurvivalModelEngine:
         if self.model is None:
             raise RuntimeError("Model must be trained before generating risk scores")
         
+        if not hasattr(self, '_risk_score_stats'):
+            raise RuntimeError("Risk score statistics not computed - retrain model or load from saved state")
+        
         # Process features using the same pipeline
         X_processed = self._get_processed_features(X)
         
@@ -958,9 +990,8 @@ class SurvivalModelEngine:
         risk_scores = -eta_predictions
         
         # Normalize to [0, 1] range
-        risk_scores = risk_scores - risk_scores.min()
-        if risk_scores.max() > 0:
-            risk_scores = risk_scores / risk_scores.max()
+        risk_scores = (risk_scores - self._risk_score_stats['min']) / self._risk_score_stats['range']
+        risk_scores = np.clip(risk_scores, 0, 1)
         
         logger.info(f"Generated risk scores - Mean: {risk_scores.mean():.3f}, Std: {risk_scores.std():.3f}")
         
@@ -1021,6 +1052,7 @@ class SurvivalModelEngine:
                     'feature_name_mapping': self.feature_processor.feature_name_mapping,
                     'transformation_summary': self.feature_processor.get_transformation_summary(),
                     'training_metadata': self.training_metadata,
+                    'risk_score_stats': getattr(self, '_risk_score_stats', None),
                     'config': {
                         'aft_distributions': self.config.aft_distributions,
                         'scale_parameter_range': self.config.scale_parameter_range,
@@ -1078,6 +1110,8 @@ class SurvivalModelEngine:
                 
                 self.feature_columns = metadata['feature_columns']
                 self.training_metadata = metadata['training_metadata']
+                if 'risk_score_stats' in metadata and metadata['risk_score_stats']:
+                    self._risk_score_stats = metadata['risk_score_stats']
             
             # Load feature processor
             processor_path = filepath.with_suffix('.pkl')
