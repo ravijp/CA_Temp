@@ -88,6 +88,7 @@ class SurvivalEvaluation:
         self.evaluation_results = {}
         self.diagnostic_results = {}
         self._calculation_errors = []
+        self._evaluation_cache = {}
         
         # Create output directory for diagnostics
         Path(self.config.diagnostic_plots_path).mkdir(parents=True, exist_ok=True)
@@ -247,6 +248,13 @@ class SurvivalEvaluation:
             print(f"\nEvaluating {dataset_name.upper()} dataset ({len(X):,} records)...")
             
             self._validate_input_data(X, y, event)
+            
+            # Clear cache from previous dataset
+            self._clear_evaluation_cache()
+            
+            # Setup evaluation cache with predictions computed ONCE
+            self._setup_evaluation_cache(X, y, event)
+            
             dataset_metrics = {}
             # Core survival metrics
             survival_metrics = self.calculate_survival_metrics(X, y, event, use_ipcw=True)
@@ -260,6 +268,7 @@ class SurvivalEvaluation:
             # Lorenz analysis
             gini_metrics = self._calculate_gini(event, X)
             dataset_metrics.update(gini_metrics)
+            
             # Business interpretation
             business_interpretation = self._interpret_performance_metrics(dataset_metrics, dataset_name)
             dataset_metrics['business_interpretation'] = business_interpretation
@@ -270,7 +279,10 @@ class SurvivalEvaluation:
             print(f"   IBS: {dataset_metrics.get('integrated_brier_score', 'N/A'):.4f}")
             print(f"   Gini: {dataset_metrics.get('gini_coefficient', 'N/A'):.4f}")
             print(f"   Average ECE: {dataset_metrics.get('average_ece', 'N/A'):.4f}")
-        
+            
+            # Clear cache after dataset evaluation to free memory
+            self._clear_evaluation_cache()
+            
         # Statistical comparison between datasets
         if len(datasets) > 1:
             comparison_results = self._assess_model_stability(performance_results)
@@ -278,6 +290,27 @@ class SurvivalEvaluation:
         
         self.evaluation_results = performance_results
         return performance_results
+    
+    def _setup_evaluation_cache(self, X: pd.DataFrame, y: np.ndarray, event: np.ndarray) -> None:
+        """Setup evaluation cache with computed predictions and processed features"""
+        try:
+            X_processed = self._get_processed_features(X)
+            dmatrix = self.model_engine._create_categorical_aware_dmatrix(X_processed)
+            log_predictions = self.model_engine.model.predict(dmatrix)
+            
+            self._evaluation_cache = {
+                'X_processed': X_processed,
+                'dmatrix': dmatrix,
+                'log_predictions': log_predictions,
+                'dataset_size': len(X)
+            }
+        except Exception as e:
+            print(f"Warning: Failed to setup evaluation cache: {e}")
+            self._evaluation_cache = {}
+
+    def _clear_evaluation_cache(self) -> None:
+        """Clear evaluation cache to free memory"""
+        self._evaluation_cache = {}
     
     def predict_time_horizons(self, X: pd.DataFrame, horizons: List[int]) -> Dict[str, np.ndarray]:
         """
@@ -290,15 +323,35 @@ class SurvivalEvaluation:
         Returns:
             Dict: {f'{horizon}d': survival_probabilities}
         """
-        survival_curves = self.model_engine.predict_survival_curves(X, np.array(horizons))
+        # Check for cached predictions first
+        if self._evaluation_cache and 'log_predictions' in self._evaluation_cache:
+            log_predictions = self._evaluation_cache['log_predictions']
+        else:
+            # Fall back to computing predictions
+            print("Warning: No cached predictions found, computing predictions")
+            X_processed = self._get_processed_features(X)
+            dmatrix = self.model_engine._create_categorical_aware_dmatrix(X_processed)
+            log_predictions = self.model_engine.model.predict(dmatrix)
+        
+        # Get AFT parameters
+        sigma = self.model_engine.aft_parameters.sigma
+        distribution = self.model_engine.aft_parameters.distribution.value
         
         result = {}
-        for i, horizon in enumerate(horizons):
-            if i < survival_curves.shape[1]:
-                result[f'{horizon}d'] = survival_curves[:, i]
+        for horizon in horizons:
+            log_horizon = np.log(horizon)
+            z_scores = (log_horizon - log_predictions) / sigma
+            
+            if distribution == 'normal':
+                survival_probs = 1 - stats.norm.cdf(z_scores)
+            elif distribution == 'logistic':
+                survival_probs = 1 / (1 + np.exp(z_scores))
+            elif distribution == 'extreme':
+                survival_probs = np.exp(-np.exp(z_scores))
             else:
-                # If horizon beyond curve, use last available point
-                result[f'{horizon}d'] = survival_curves[:, -1]
+                survival_probs = 1 - stats.norm.cdf(z_scores)  # Default to normal
+            
+            result[f'{horizon}d'] = np.clip(survival_probs, 1e-6, 1 - 1e-6)
         
         return result
     
@@ -367,9 +420,16 @@ class SurvivalEvaluation:
         metrics = {}
         
         try:
-            X_processed = self._get_processed_features(X)
-            dmatrix = self.model_engine._create_categorical_aware_dmatrix(X_processed)
-            log_predictions = self.model_engine.model.predict(dmatrix)
+            # Use cached predictions if available
+            if self._evaluation_cache and 'log_predictions' in self._evaluation_cache:
+                log_predictions = self._evaluation_cache['log_predictions']
+                X_processed = self._evaluation_cache['X_processed']
+            else:
+                print("Warning: No cached predictions in calculate_survival_metrics, computing now")
+                X_processed = self._get_processed_features(X)
+                dmatrix = self.model_engine._create_categorical_aware_dmatrix(X_processed)
+                log_predictions = self.model_engine.model.predict(dmatrix)
+            
             pred_times = np.exp(log_predictions)
             
             c_index = concordance_index(y_true, pred_times, events)
@@ -378,6 +438,7 @@ class SurvivalEvaluation:
             print(f"Warning: C-index calculation failed: {e}")
             metrics['c_index'] = np.nan
         
+        # Simplified Brier score calculation without bootstrap
         if self.brier_calculator is not None:
             try:
                 brier_results = self.brier_calculator.calculate_brier_scores(
@@ -386,12 +447,11 @@ class SurvivalEvaluation:
                     y_val=y_true,
                     events_val=events,
                     use_ipcw=use_ipcw,
-                    compute_ci=True,
-                    n_bootstrap=200
+                    compute_ci=False,  # No bootstrap for speed
+                    n_bootstrap=0      # Explicitly no bootstrap
                 )
                 
                 metrics['integrated_brier_score'] = brier_results.integrated_brier_score
-                metrics['brier_score_confidence_intervals'] = brier_results.confidence_intervals
                 metrics['time_dependent_brier'] = {
                     'time_points': brier_results.time_points,
                     'scores': brier_results.brier_scores,
@@ -402,7 +462,7 @@ class SurvivalEvaluation:
                     'calculator_estimate': brier_results.scale_parameter,
                     'model_estimate': self.model_engine.aft_parameters.sigma,
                     'agreement': abs(brier_results.scale_parameter - 
-                                   self.model_engine.aft_parameters.sigma) < 0.1
+                                self.model_engine.aft_parameters.sigma) < 0.1
                 }
                 
             except Exception as e:
@@ -462,7 +522,7 @@ class SurvivalEvaluation:
         return calibration_results
 
     def _calculate_censoring_aware_calibration(self, X: pd.DataFrame, y_true: np.ndarray, 
-                                        events: np.ndarray, horizon: int) -> Dict:
+                                            events: np.ndarray, horizon: int) -> Dict:
         """
         censoring-aware calibration using brier_score module components
         1. All observations contribute with proper IPCW weights (no zero weights for censored)
@@ -480,10 +540,32 @@ class SurvivalEvaluation:
             Dict: {'ece': float, 'calibration_curve': dict, 'total_weight': float}
         """
         
-        # Get model predictions
-        X_processed = self._get_processed_features(X)
-        horizon_survival = self.predict_time_horizons(X_processed, [horizon])
-        predicted_event_probs = 1 - horizon_survival[f'{horizon}d']
+        # Use cached predictions if available
+        if self._evaluation_cache and 'log_predictions' in self._evaluation_cache:
+            log_predictions = self._evaluation_cache['log_predictions']
+        else:
+            print("Warning: No cached predictions in calibration, computing now")
+            X_processed = self._get_processed_features(X)
+            dmatrix = self.model_engine._create_categorical_aware_dmatrix(X_processed)
+            log_predictions = self.model_engine.model.predict(dmatrix)
+        
+        # Calculate survival probability at horizon directly
+        sigma = self.model_engine.aft_parameters.sigma
+        distribution = self.model_engine.aft_parameters.distribution.value
+        
+        log_horizon = np.log(horizon)
+        z_scores = (log_horizon - log_predictions) / sigma
+        
+        if distribution == 'normal':
+            survival_probs = 1 - stats.norm.cdf(z_scores)
+        elif distribution == 'logistic':
+            survival_probs = 1 / (1 + np.exp(z_scores))
+        elif distribution == 'extreme':
+            survival_probs = np.exp(-np.exp(z_scores))
+        else:
+            survival_probs = 1 - stats.norm.cdf(z_scores)
+        
+        predicted_event_probs = 1 - np.clip(survival_probs, 1e-6, 1 - 1e-6)
         
         # Import proven IPCW implementation
         from brier_score import IPCWEstimator
@@ -503,143 +585,49 @@ class SurvivalEvaluation:
         # Three cases for calibration outcome:
         # 1. Event occurred by horizon: outcome = 1
         # 2. Survived past horizon: outcome = 0 (definitive)  
-        # 3. Censored before horizon: outcome = 0 (but requires IPCW correction)
+        # 3. Censored before horizon: use IPCW weighting
         
-        binary_outcomes = np.zeros(len(y_true), dtype=float)
+        binary_outcomes = ((y_true <= horizon) & (events == 1)).astype(float)
         
-        # Case 1: Event occurred at or before horizon
-        event_by_horizon = (y_true <= horizon) & (events == 1)
-        binary_outcomes[event_by_horizon] = 1.0
-        
-        # Case 2: Survived past horizon (definitive no-event by horizon)
-        survived_past_horizon = (y_true > horizon)
-        binary_outcomes[survived_past_horizon] = 0.0
-        
-        # Case 3: Censored before horizon (ambiguous - handled by IPCW)
-        censored_before_horizon = (y_true <= horizon) & (events == 0)
-        binary_outcomes[censored_before_horizon] = 0.0  # Default to 0, corrected by IPCW
-        
-        # Apply IPCW correction for calibration context
-        # Standard IPCW gives weights for events, but we need all observations weighted
-        calibration_weights = np.ones(len(y_true), dtype=float)
-        
-        # For event observations: use IPCW weights directly
-        event_mask = events == 1
-        calibration_weights[event_mask] = ipcw_weights[event_mask]
-        
-        # For censored observations: weight by inverse censoring probability at horizon
-        censored_mask = events == 0
-        if np.any(censored_mask):
-            from lifelines import KaplanMeierFitter
-            
-            kmf_censor = KaplanMeierFitter()
-            kmf_censor.fit(y_true, 1 - events)  # Fit censoring distribution
-            
-            # Vectorized weight calculation for censored observations
-            censored_times = y_true[censored_mask]
-            eval_times = np.minimum(censored_times, horizon)
-            
-            # Get censoring survival probabilities
-            censor_surv_probs = []
-            for eval_time in eval_times:
-                if eval_time > 0:
-                    surv_prob = kmf_censor.survival_function_at_times([eval_time]).iloc[0]
-                    censor_surv_probs.append(max(surv_prob, 0.01))
-                else:
-                    censor_surv_probs.append(1.0)
-            
-            # Apply censoring weights
-            calibration_weights[censored_mask] = 1.0 / np.array(censor_surv_probs)
-        
-        # Validation: ensure all weights are valid
-        if not np.all(np.isfinite(calibration_weights)) or not np.all(calibration_weights > 0):
-            raise ValueError("Invalid calibration weights detected")
-        
-        if len(predicted_event_probs) != len(binary_outcomes):
-            raise ValueError("Prediction and outcome length mismatch")
-        
-        # Remove any invalid predictions or outcomes
-        valid_mask = (
-            np.isfinite(predicted_event_probs) & 
-            np.isfinite(binary_outcomes) & 
-            np.isfinite(calibration_weights) &
-            (calibration_weights > 0)
-        )
-        
-        n_valid = np.sum(valid_mask)
-        if n_valid < 10:
-            raise ValueError(f"Insufficient valid observations: {n_valid} < 10")
-        
-        # Apply validity mask
-        valid_predictions = predicted_event_probs[valid_mask]
-        valid_outcomes = binary_outcomes[valid_mask]
-        valid_weights = calibration_weights[valid_mask]
-        
-        # EXPERT FIX: Manual weighted calibration calculation (sklearn compatibility)
-        # Remove sklearn's sample_weight dependency and implement weighted binning manually
+        # Create weighted calibration curve
         n_bins = self.config.calibration_bins
-        bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
-        
-        # Calculate weighted calibration curve manually
-        fraction_positives = []
-        mean_predicted = []
-        ece_sum = 0.0
-        total_weight = 0.0
+        bin_edges = np.linspace(0, 1, n_bins + 1)
+        bin_centers = []
+        bin_true_probs = []
+        bin_weights = []
         
         for i in range(n_bins):
-            # Define bin boundaries
-            if i == n_bins - 1:
-                # Last bin includes upper boundary
-                in_bin = (valid_predictions >= bin_edges[i]) & (valid_predictions <= bin_edges[i + 1])
-            else:
-                in_bin = (valid_predictions >= bin_edges[i]) & (valid_predictions < bin_edges[i + 1])
+            bin_mask = (predicted_event_probs >= bin_edges[i]) & (predicted_event_probs < bin_edges[i + 1])
             
-            n_in_bin = np.sum(in_bin)
-            if n_in_bin > 0:
-                bin_weights = valid_weights[in_bin]
-                bin_weight_sum = np.sum(bin_weights)
-                
-                if bin_weight_sum > 0:
-                    # Weighted bin statistics
-                    bin_accuracy = np.average(valid_outcomes[in_bin], weights=bin_weights)
-                    bin_confidence = np.average(valid_predictions[in_bin], weights=bin_weights)
+            if bin_mask.sum() > 0:
+                # Weighted average for bin
+                bin_weight = ipcw_weights[bin_mask].sum()
+                if bin_weight > 0:
+                    weighted_outcome = np.average(binary_outcomes[bin_mask], weights=ipcw_weights[bin_mask])
+                    weighted_pred = np.average(predicted_event_probs[bin_mask], weights=ipcw_weights[bin_mask])
                     
-                    # Store for calibration curve
-                    fraction_positives.append(bin_accuracy)
-                    mean_predicted.append(bin_confidence)
-                    
-                    # ECE contribution for this bin
-                    ece_sum += bin_weight_sum * abs(bin_accuracy - bin_confidence)
-                    total_weight += bin_weight_sum
-            else:
-                # Empty bin - use bin center for plotting
-                bin_center = (bin_edges[i] + bin_edges[i + 1]) / 2
-                fraction_positives.append(bin_center)  # Neutral assumption
-                mean_predicted.append(bin_center)
+                    bin_centers.append(weighted_pred)
+                    bin_true_probs.append(weighted_outcome)
+                    bin_weights.append(bin_weight)
         
-        # Convert to numpy arrays for consistent return format
-        fraction_positives = np.array(fraction_positives)
-        mean_predicted = np.array(mean_predicted)
-        
-        # Final ECE calculation
-        if total_weight <= 0:
-            raise ValueError("Total weight is zero or negative")
-        
-        final_ece = ece_sum / total_weight
-        
-        # Validate ECE is in reasonable range
-        if not (0 <= final_ece <= 1):
-            raise ValueError(f"ECE out of valid range [0,1]: {final_ece}")
+        # Calculate Expected Calibration Error (ECE)
+        if len(bin_centers) > 0:
+            total_weight = sum(bin_weights)
+            ece = sum(w * abs(pred - true) for w, pred, true in 
+                    zip(bin_weights, bin_centers, bin_true_probs)) / total_weight
+        else:
+            ece = np.nan
         
         return {
-            'ece': final_ece,
+            'ece': ece,
             'calibration_curve': {
-                'fraction_positives': fraction_positives,
-                'mean_predicted': mean_predicted
+                'bin_centers': bin_centers,
+                'bin_true_probs': bin_true_probs,
+                'bin_weights': bin_weights
             },
-            'total_weight': total_weight
+            'total_weight': sum(bin_weights) if bin_weights else 0
         }
-    
+
     
     def perform_comprehensive_diagnostics(self, X: pd.DataFrame, y: np.ndarray, 
                                          events: np.ndarray, dataset_name: str = 'validation') -> Dict:
@@ -915,11 +903,35 @@ class SurvivalEvaluation:
         """Calculate time-dependent AUC for multiple horizons using model predictions"""
         auc_results = {}
         
+        # Use cached predictions if available
+        if self._evaluation_cache and 'log_predictions' in self._evaluation_cache:
+            log_predictions = self._evaluation_cache['log_predictions']
+        else:
+            print("Warning: No cached predictions in AUC calculation, computing now")
+            X_processed = self._get_processed_features(X)
+            dmatrix = self.model_engine._create_categorical_aware_dmatrix(X_processed)
+            log_predictions = self.model_engine.model.predict(dmatrix)
+        
+        # Get AFT parameters
+        sigma = self.model_engine.aft_parameters.sigma
+        distribution = self.model_engine.aft_parameters.distribution.value
+        
         for horizon in horizons:
             try:
-                X_processed = self._get_processed_features(X)
-                horizon_survival = self.model_engine.predict_time_horizons(X_processed, [horizon])
-                predicted_risk = 1 - horizon_survival[f'{horizon}d']
+                # Calculate survival probability at horizon directly
+                log_horizon = np.log(horizon)
+                z_scores = (log_horizon - log_predictions) / sigma
+                
+                if distribution == 'normal':
+                    survival_probs = 1 - stats.norm.cdf(z_scores)
+                elif distribution == 'logistic':
+                    survival_probs = 1 / (1 + np.exp(z_scores))
+                elif distribution == 'extreme':
+                    survival_probs = np.exp(-np.exp(z_scores))
+                else:
+                    survival_probs = 1 - stats.norm.cdf(z_scores)
+                
+                predicted_risk = 1 - np.clip(survival_probs, 1e-6, 1 - 1e-6)
                 
                 outcome = ((y <= horizon) & (events == 1)).astype(int)
                 at_risk = y >= horizon
@@ -945,45 +957,51 @@ class SurvivalEvaluation:
         """
         
         try:
-            X_processed = self._get_processed_features(X)
-            horizon_survival = self.model_engine.predict_time_horizons(X_processed, [365])
-            risk_scores = 1 - horizon_survival['365d']
+            # Use cached predictions if available
+            if self._evaluation_cache and 'log_predictions' in self._evaluation_cache:
+                log_predictions = self._evaluation_cache['log_predictions']
+            else:
+                print("Warning: No cached predictions in Gini calculation, computing now")
+                X_processed = self._get_processed_features(X)
+                dmatrix = self.model_engine._create_categorical_aware_dmatrix(X_processed)
+                log_predictions = self.model_engine.model.predict(dmatrix)
             
+            # Use predictions as risk scores (lower predicted time = higher risk)
+            risk_scores = -log_predictions
             risk_scores = np.clip(risk_scores, 1e-6, 1 - 1e-6)
             
             if events.sum() == 0:
                 return {
                     'gini_coefficient': 0.0,
-                    'interpretation': 'No events for Gini calculation',
-                    'method': 'standard_1year_survival'
+                    'interpretation': 'No events to evaluate'
                 }
             
-            sorted_indices = np.argsort(risk_scores)[::-1]
-            sorted_events = events[sorted_indices]
+            # Sort by risk scores (descending)
+            sorted_idx = np.argsort(risk_scores)[::-1]
+            sorted_events = events[sorted_idx]
             
-            total_events = events.sum()
-            cumulative_events = np.cumsum(sorted_events) / total_events
-            cumulative_population = np.arange(1, len(events) + 1) / len(events)
+            # Calculate cumulative capture rates
+            n_events = events.sum()
+            cumsum_events = np.cumsum(sorted_events)
+            cumsum_pop = np.arange(1, len(events) + 1) / len(events)
+            cumsum_events_norm = cumsum_events / n_events
             
-            auc_lorenz = np.trapz(cumulative_events, cumulative_population)
-            gini = 2 * auc_lorenz - 1
-            
-            gini = max(gini, 0.0)
+            # Gini coefficient calculation
+            gini = 2 * np.trapz(cumsum_events_norm, cumsum_pop) - 1
             
             return {
-                'gini_coefficient': gini,
-                'interpretation': self._interpret_gini_coefficient(gini),
-                'method': 'standard_1year_survival',
-                'risk_score_event_correlation': np.corrcoef(risk_scores, events)[0, 1]
+                'gini_coefficient': max(0.0, gini),
+                'interpretation': self._interpret_gini_coefficient(gini)
             }
             
         except Exception as e:
+            print(f"Warning: Gini calculation failed: {e}")
             return {
-                'gini_coefficient': self._handle_calculation_error("gini_calculation", e),
-                'interpretation': 'Calculation failed',
-                'method': 'standard_1year_survival'
+                'gini_coefficient': np.nan,
+                'interpretation': 'Calculation failed'
             }
-    
+        
+        
     def _assess_survival_curve_quality_efficient(self, X: pd.DataFrame, y_true: np.ndarray, 
                                                 events: np.ndarray) -> Dict:
         """

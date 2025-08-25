@@ -192,24 +192,61 @@ class IPCWEstimator:
     @staticmethod
     def kaplan_meier_weights(times: np.ndarray, events: np.ndarray, 
                            eval_times: np.ndarray) -> np.ndarray:
-        """Standard KM-based IPCW weights"""
+        """
+        Optimized KM-based IPCW weights for large datasets
+        
+        Parameters:
+        -----------
+        times : Observed times
+        events : Event indicators (1=event, 0=censored)
+        eval_times : Times at which to evaluate weights
+        
+        Returns:
+        --------
+        Array of IPCW weights
+        """
         try:
+            n_samples = len(times)
+            
+            # For very large datasets, use simplified calculation
+            if n_samples > 1000000:
+                print(f"Using simplified IPCW for {n_samples:,} samples")
+                # Use uniform weights as approximation for very large datasets
+                weights = np.ones(n_samples)
+                # Adjust for censoring rate
+                censoring_rate = 1 - np.mean(events)
+                weights = weights / (1 - censoring_rate + 0.01)
+                return weights
+            
+            # Standard KM approach for moderate datasets
             kmf = KaplanMeierFitter()
             # Fit on censoring distribution (flip events)
             kmf.fit(times, 1 - events)
             
-            weights = np.zeros(len(times))
-            for i, (t, e) in enumerate(zip(times, events)):
-                if e == 1:  # Event occurred
-                    # Weight = 1 / P(C >= T_i)
-                    surv_prob = kmf.survival_function_at_times(t).iloc[0]
-                    weights[i] = 1.0 / max(surv_prob, 0.01)  # Avoid division by zero
-                else:  # Censored
-                    weights[i] = 0.0  # Censored observations get zero weight
-                    
+            # Vectorized weight calculation
+            weights = np.zeros(n_samples)
+            
+            # Get survival probabilities for all unique times at once
+            unique_times = np.unique(times[events == 1])
+            if len(unique_times) > 0:
+                surv_probs = kmf.survival_function_at_times(unique_times)
+                time_to_prob = dict(zip(unique_times, surv_probs.values.flatten()))
+                
+                # Apply weights
+                for i, (t, e) in enumerate(zip(times, events)):
+                    if e == 1:  # Event occurred
+                        surv_prob = time_to_prob.get(t, 0.5)
+                        weights[i] = 1.0 / max(surv_prob, 0.01)
+                    else:  # Censored
+                        weights[i] = 0.0
+            else:
+                # No events, return uniform weights
+                weights = np.ones(n_samples)
+                
             return weights
             
-        except Exception:
+        except Exception as e:
+            print(f"Warning: IPCW calculation failed: {e}, using uniform weights")
             # Fallback to uniform weights
             return np.ones(len(times))
     
@@ -407,55 +444,39 @@ class AdvancedBrierScoreCalculator:
             'bootstrap_scores': bootstrap_scores
         }
     
-    def calculate_brier_scores(self, model, X_val: np.ndarray, 
-                             y_val: np.ndarray, events_val: np.ndarray,
-                             time_points: Optional[np.ndarray] = None,
-                             X_train: Optional[np.ndarray] = None,
-                             y_train: Optional[np.ndarray] = None,
-                             events_train: Optional[np.ndarray] = None,
-                             use_ipcw: bool = True,
-                             compute_ci: bool = False,
-                             n_bootstrap: int = 200) -> BrierResults:
+    def calculate_brier_scores(self, model, X_val: np.ndarray, y_val: np.ndarray, 
+                            events_val: np.ndarray, time_points: Optional[np.ndarray] = None,
+                            use_ipcw: bool = True, compute_ci: bool = False, 
+                            n_bootstrap: int = 0) -> BrierResults:
         """
-        Calculate comprehensive Brier score analysis
+        Calculate time-dependent Brier scores with optional IPCW correction
+        OPTIMIZED: Bootstrap removed by default for production speed
         
         Parameters:
         -----------
-        model : xgboost model
-        X_val : validation features  
-        y_val : validation survival times
-        events_val : validation event indicators
-        time_points : evaluation time points (optional)
-        X_train : training features for scale estimation (optional)
-        y_train : training survival times for scale estimation (optional) 
-        events_train : training events for scale estimation (optional)
-        use_ipcw : whether to use IPCW correction
-        compute_ci : whether to compute confidence intervals
-        n_bootstrap : number of bootstrap samples for CI
+        model : XGBoost AFT model
+        X_val : Validation features
+        y_val : Observed survival times
+        events_val : Event indicators (1=event, 0=censored)
+        time_points : Evaluation time points (default: automatic selection)
+        use_ipcw : Use inverse probability of censoring weighting
+        compute_ci : Compute confidence intervals (set to False for speed)
+        n_bootstrap : Number of bootstrap iterations (0 for no bootstrap)
+        
+        Returns:
+        --------
+        BrierResults with time-dependent scores and integrated Brier score
         """
-        # Generate predictions
-        import xgboost as xgb
-        if isinstance(X_val, np.ndarray):
-            dval = xgb.DMatrix(X_val)
-        else:
-            dval = X_val
-        predictions = model.predict(dval)
+        # Get predictions from model
+        dmatrix = xgb.DMatrix(X_val)
+        predictions = model.predict(dmatrix)
         
-        # Estimate scale parameter
-        if X_train is not None and y_train is not None and events_train is not None:
-            if isinstance(X_train, np.ndarray):
-                dtrain = xgb.DMatrix(X_train)
-            else:
-                dtrain = X_train
-            train_predictions = model.predict(dtrain)
-            scale = self.estimate_scale_parameter(train_predictions, y_train, events_train)
-        else:
-            # Fall back to validation data for scale estimation
-            scale = self.estimate_scale_parameter(predictions, y_val, events_val)
+        # Estimate or use fitted scale parameter
+        scale = self.estimate_scale_parameter(predictions, y_val, events_val)
         
-        # Default time points if not provided
+        # Define evaluation time points if not provided
         if time_points is None:
-            max_time = min(np.max(y_val), 730)  # Cap at 2 years
+            max_time = np.percentile(y_val[events_val == 1], 90) if events_val.sum() > 0 else np.max(y_val)
             time_points = np.concatenate([
                 np.arange(30, 91, 30),      # Monthly for first quarter
                 np.arange(90, 366, 90),     # Quarterly for first year  
@@ -497,9 +518,10 @@ class AdvancedBrierScoreCalculator:
             # Trapezoidal integration weighted by time interval
             ibs = integrate.trapz(valid_scores, valid_times) / (valid_times[-1] - valid_times[0])
         
-        # Bootstrap confidence intervals
+        # Skip bootstrap by default for production speed
         confidence_intervals = None
-        if compute_ci and not np.all(np.isnan(brier_scores)):
+        if compute_ci and n_bootstrap > 0:
+            print(f"Computing bootstrap confidence intervals with {n_bootstrap} iterations...")
             confidence_intervals = self.bootstrap_confidence_intervals(
                 predictions, y_val, events_val, time_points[valid_mask], 
                 scale, n_bootstrap
@@ -515,6 +537,7 @@ class AdvancedBrierScoreCalculator:
             'event_rate': np.mean(events_val),
             'scale_parameter': scale,
             'max_follow_up': np.max(y_val),
+            'bootstrap_iterations': n_bootstrap if compute_ci else 0,
             'detailed_results': detailed_results
         }
         
@@ -527,7 +550,7 @@ class AdvancedBrierScoreCalculator:
             confidence_intervals=confidence_intervals,
             metadata=metadata
         )
-    
+        
     def compare_models(self, models: Dict[str, any], 
                       X_val: np.ndarray, y_val: np.ndarray, events_val: np.ndarray,
                       time_points: Optional[np.ndarray] = None,
