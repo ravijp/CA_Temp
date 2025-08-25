@@ -338,65 +338,114 @@ class AdvancedBrierScoreCalculator:
         
         return surv_matrix
     
-    def _compute_time_dependent_brier(self, time_point: float,
+    def _compute_time_dependent_brier(self,
+                                    time_point: float,
                                     predictions: np.ndarray,
                                     observed_times: np.ndarray,
                                     events: np.ndarray,
                                     scale: float,
                                     weights: Optional[np.ndarray] = None) -> Dict:
-        """Compute Brier score at specific time point"""
+        """
+        IPCW Brier score at `time_point` (Graf et al., 1999).
+
+        Keeps the same signature. `weights` (if provided) are *external*
+        per-subject multipliers and are applied on top of IPCW.
+        """
         n = len(predictions)
-        
-        # Survival probabilities at time_point
+
+        # survival and event probabilities at t
         surv_probs = self.handler.survival_function(time_point, predictions, scale)
-        
-        # Convert to EVENT probabilities for Brier score
-        event_probs = 1 - surv_probs
-        
-        # Binary outcomes at time_point (1 if event occurred by t, 0 otherwise)
-        binary_outcomes = ((observed_times <= time_point) & (events == 1)).astype(float)
-        
+        event_probs = 1.0 - surv_probs
+
+        # External weights (class weights etc.)
         if weights is None:
-            weights = np.ones(n)
-        
-        # CORRECTED Brier score calculation
-        # BS = weighted mean of (predicted_event_prob - actual_outcome)^2
-        brier_components = np.zeros(n)
-        valid_mask = np.zeros(n, dtype=bool)
-        
-        for i in range(n):
-            if events[i] == 1 and observed_times[i] <= time_point:
-                # Event occurred by time t: actual outcome = 1
-                brier_components[i] = weights[i] * ((event_probs[i])**2)
-                valid_mask[i] = True
-            elif observed_times[i] > time_point:
-                # Survived past time t: actual outcome = 0
-                brier_components[i] = weights[i] * ((event_probs[i] - 1)**2)
-                valid_mask[i] = True
-            elif events[i] == 0 and observed_times[i] <= time_point:
-                # Censored before time t: use IPCW weight, actual outcome = 0
-                # (they didn't have event by censoring time)
-                brier_components[i] = weights[i] * ((event_probs[i] - 0)**2)
-                valid_mask[i] = True
-        
-        if valid_mask.sum() == 0:
-            return {'brier_score': np.nan, 'n_at_risk': 0, 'n_events': 0}
-        
-        # Weighted average
-        total_weight = weights[valid_mask].sum()
-        brier_score = np.sum(brier_components[valid_mask]) / total_weight
-        
-        n_at_risk = (observed_times >= time_point).sum()
-        n_events = ((observed_times <= time_point) & (events == 1)).sum()
-        
+            w_ext = np.ones(n, dtype=float)
+        else:
+            w_ext = np.asarray(weights, dtype=float)
+
+        T = np.asarray(observed_times, dtype=float)
+        D = np.asarray(events, dtype=int)
+
+        # ---- IPCW pieces: KM of censoring distribution G(t) ----
+        # Cache across calls to avoid O(n log n) per time point on large data
+        if not hasattr(self, "_ipcw_cache") or self._ipcw_cache.get("n", None) != n \
+        or self._ipcw_cache.get("hash", None) != (T.__array_interface__['data'][0], D.__array_interface__['data'][0]):
+            # Build KM for censoring using numpy (fast + no per-row loops)
+            order = np.argsort(T)
+            t_sorted = T[order]
+            cens_sorted = (1 - D)[order]
+
+            uniq, idx = np.unique(t_sorted, return_index=True)
+            at_risk = n - idx
+            d_c = np.add.reduceat(cens_sorted, idx)  # # censored at each uniq time
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                factors = 1.0 - d_c / at_risk
+                factors = np.clip(factors, 0.0, 1.0)
+
+            G_right = np.cumprod(factors)                 # right-continuous G(t)
+            G_left = np.empty_like(G_right)               # left limits G(t-)
+            G_left[0] = 1.0
+            if len(G_right) > 1:
+                G_left[1:] = G_right[:-1]
+
+            self._ipcw_cache = {
+                "uniq": uniq,
+                "G_right": G_right,
+                "G_left": G_left,
+                "n": n,
+                "hash": (T.__array_interface__['data'][0], D.__array_interface__['data'][0])
+            }
+
+        uniq = self._ipcw_cache["uniq"]
+        G_right = self._ipcw_cache["G_right"]
+        G_left = self._ipcw_cache["G_left"]
+
+        # Step-function evaluation (right- or left-continuous)
+        def _step_eval(x_times, y_vals, x, left=False):
+            x = np.asarray(x, dtype=float)
+            idx = np.searchsorted(x_times, x, side=("left" if left else "right")) - 1
+            idx = np.clip(idx, -1, len(x_times) - 1)
+            out = np.ones_like(x, dtype=float)
+            m = idx >= 0
+            out[m] = y_vals[idx[m]]
+            return out
+
+        # Denominators: G(t) and G(T_i^-)
+        G_t = _step_eval(uniq, G_right, np.array([time_point]))[0]
+        G_T_left = _step_eval(uniq, G_left, T, left=True)
+        eps = 1e-12
+        G_t = max(G_t, eps)
+        G_T_left = np.maximum(G_T_left, eps)
+
+        # Indicators
+        died_by_t = (T <= time_point) & (D == 1)
+        alive_at_t = T > time_point
+
+        # Graf et al. IPCW terms
+        term_event = np.zeros(n, dtype=float)
+        term_event[died_by_t] = (event_probs[died_by_t] - 1.0) ** 2 / G_T_left[died_by_t]
+
+        term_alive = np.zeros(n, dtype=float)
+        term_alive[alive_at_t] = (event_probs[alive_at_t] - 0.0) ** 2 / G_t
+
+        contrib = (term_event + term_alive) * w_ext
+        brier_score = float(contrib.sum() / w_ext.sum())
+
+        n_at_risk = int((T > time_point).sum())
+        n_events = int(((T <= time_point) & (D == 1)).sum())
+        event_rate_actual = n_events / (n_events + n_at_risk) if (n_events + n_at_risk) > 0 else 0.0
+
         return {
-            'brier_score': brier_score,
-            'n_at_risk': n_at_risk,
-            'n_events': n_events,
-            'event_probs_mean': np.mean(event_probs),
-            'event_probs_std': np.std(event_probs)
+            "brier_score": brier_score,
+            "n_at_risk": n_at_risk,
+            "n_events": n_events,
+            "event_probs_mean": float(np.mean(event_probs)),
+            "event_probs_std": float(np.std(event_probs)),
+            "actual_event_rate": float(event_rate_actual),
+            "calibration_gap": float(abs(event_rate_actual - np.mean(event_probs)))
         }
-    
+
     def bootstrap_confidence_intervals(self, predictions: np.ndarray,
                                      observed_times: np.ndarray,
                                      events: np.ndarray,
@@ -516,8 +565,12 @@ class AdvancedBrierScoreCalculator:
         else:
             valid_times = time_points[valid_mask]
             valid_scores = brier_scores[valid_mask]
-            # Trapezoidal integration weighted by time interval
-            ibs = integrate.trapz(valid_scores, valid_times) / (valid_times[-1] - valid_times[0])
+            # Ensure integration from ~0 (BS(0)=0 for proper survival models)
+            if valid_times[0] > 0:
+                valid_times = np.insert(valid_times, 0, 0.0)
+                valid_scores = np.insert(valid_scores, 0, 0.0)
+            ibs = integrate.trapz(valid_scores, valid_times) / valid_times[-1]
+
         
         # Skip bootstrap by default for production speed
         confidence_intervals = None
