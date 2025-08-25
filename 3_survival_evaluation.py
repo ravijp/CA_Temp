@@ -483,9 +483,9 @@ class SurvivalEvaluation:
         return metrics
     
     def calculate_calibration_metrics(self, X: pd.DataFrame, y_true: np.ndarray, 
-                                               events: np.ndarray, horizons: List[int]) -> Dict:
+                                 events: np.ndarray, horizons: List[int]) -> Dict:
         """
-        Multi-horizon calibration assessment with corrected calculations
+        Multi-horizon calibration with batch computation
         
         Args:
             X: Feature matrix
@@ -497,21 +497,56 @@ class SurvivalEvaluation:
             Dict: Calibration metrics by horizon with overall assessment
         """
         calibration_results = {}
+        
+        # Get cached predictions or compute once
+        if self._evaluation_cache and 'log_predictions' in self._evaluation_cache:
+            log_predictions = self._evaluation_cache['log_predictions']
+        else:
+            print("Warning: No cached predictions in calibration, computing now")
+            X_processed = self._get_processed_features(X)
+            dmatrix = self.model_engine._create_categorical_aware_dmatrix(X_processed)
+            log_predictions = self.model_engine.model.predict(dmatrix)
+        
+        # OPTIMIZATION: Batch compute all horizon probabilities at once
+        sigma = self.model_engine.aft_parameters.sigma
+        distribution = self.model_engine.aft_parameters.distribution.value
+        
+        # Pre-compute event probabilities for all horizons
+        all_event_probs = {}
+        for horizon in horizons:
+            log_horizon = np.log(horizon)
+            z_scores = (log_horizon - log_predictions) / sigma
+            
+            if distribution == 'normal':
+                survival_probs = 1 - stats.norm.cdf(z_scores)
+            elif distribution == 'logistic':
+                survival_probs = 1 / (1 + np.exp(z_scores))
+            elif distribution == 'extreme':
+                survival_probs = np.exp(-np.exp(z_scores))
+            else:
+                survival_probs = 1 - stats.norm.cdf(z_scores)
+            
+            all_event_probs[horizon] = 1 - np.clip(survival_probs, 1e-6, 1 - 1e-6)
+        
+        # Calculate ECE for each horizon using pre-computed probabilities
         horizon_eces = []
         
         for horizon in horizons:
             try:
-                calibration_result = self._calculate_censoring_aware_calibration(X, y_true, events, horizon)
+                # Use fast ECE calculation
+                ece = self._calculate_fast_ece(
+                    all_event_probs[horizon], 
+                    y_true, 
+                    events, 
+                    horizon
+                )
                 
-                if not np.isnan(calibration_result['ece']):
-                    calibration_results[f'ece_{horizon}d'] = calibration_result['ece']
-                    calibration_results[f'calibration_curve_{horizon}d'] = calibration_result['calibration_curve']
-                    horizon_eces.append(calibration_result['ece'])
-                else:
-                    calibration_results[f'ece_{horizon}d'] = np.nan
+                calibration_results[f'ece_{horizon}d'] = ece
+                if not np.isnan(ece):
+                    horizon_eces.append(ece)
                     
             except Exception as e:
-                print(f"Warning: Calibration calculation failed for {horizon}d: {e}")
+                print(f"Warning: ECE calculation failed for {horizon}d: {e}")
                 calibration_results[f'ece_{horizon}d'] = np.nan
         
         # Average ECE across horizons
@@ -520,6 +555,63 @@ class SurvivalEvaluation:
         calibration_results['calibration_quality'] = self._assess_calibration_quality(valid_eces)
         
         return calibration_results
+    
+    def _calculate_fast_ece(self, predicted_event_probs: np.ndarray, 
+                            y_true: np.ndarray, events: np.ndarray, 
+                            horizon: int, n_bins: int = 10) -> float:
+        """
+        Fast ECE calculation without heavy IPCW computation
+        Uses only uncensored observations for calibration
+        
+        Args:
+            predicted_event_probs: Model's predicted event probabilities
+            y_true: Actual survival times
+            events: Event indicators
+            horizon: Time horizon
+            n_bins: Number of calibration bins
+            
+        Returns:
+            float: Expected Calibration Error
+        """
+        # Only use observations we can evaluate (uncensored or survived past horizon)
+        evaluable_mask = (events == 1) | (y_true > horizon)
+        
+        if evaluable_mask.sum() < 100:  # Too few observations
+            return np.nan
+        
+        # Get evaluable observations
+        pred_probs_eval = predicted_event_probs[evaluable_mask]
+        y_eval = y_true[evaluable_mask]
+        events_eval = events[evaluable_mask]
+        
+        # Actual outcomes for evaluable observations
+        actual_outcomes = ((y_eval <= horizon) & (events_eval == 1)).astype(float)
+        
+        # VECTORIZED binning using numpy
+        bin_edges = np.linspace(0, 1, n_bins + 1)
+        bin_indices = np.digitize(pred_probs_eval, bin_edges[:-1]) - 1
+        bin_indices = np.clip(bin_indices, 0, n_bins - 1)
+        
+        # Calculate ECE using vectorized operations
+        ece = 0.0
+        total_count = len(pred_probs_eval)
+        
+        for bin_idx in range(n_bins):
+            bin_mask = (bin_indices == bin_idx)
+            n_in_bin = bin_mask.sum()
+            
+            if n_in_bin > 10:  # Minimum samples for reliable estimate
+                # Mean predicted probability in bin
+                mean_pred = pred_probs_eval[bin_mask].mean()
+                
+                # Mean actual outcome in bin
+                mean_actual = actual_outcomes[bin_mask].mean()
+                
+                # Weighted contribution to ECE
+                bin_weight = n_in_bin / total_count
+                ece += bin_weight * abs(mean_pred - mean_actual)
+        
+        return ece
 
     def _calculate_censoring_aware_calibration(self, X: pd.DataFrame, y_true: np.ndarray, 
                                             events: np.ndarray, horizon: int) -> Dict:
@@ -899,11 +991,13 @@ class SurvivalEvaluation:
         plt.show()
 
     def _calculate_time_dependent_auc(self, X: pd.DataFrame, y: np.ndarray, 
-                                    events: np.ndarray, horizons: List[int]) -> Dict:
-        """Calculate time-dependent AUC for multiple horizons using model predictions"""
+                                 events: np.ndarray, horizons: List[int]) -> Dict:
+        """
+        Batch compute AUC for all horizons
+        """
         auc_results = {}
         
-        # Use cached predictions if available
+        # Use cached predictions
         if self._evaluation_cache and 'log_predictions' in self._evaluation_cache:
             log_predictions = self._evaluation_cache['log_predictions']
         else:
@@ -916,27 +1010,39 @@ class SurvivalEvaluation:
         sigma = self.model_engine.aft_parameters.sigma
         distribution = self.model_engine.aft_parameters.distribution.value
         
+        # Batch compute risk scores for all horizons
+        all_risk_scores = {}
+        
+        for horizon in horizons:
+            log_horizon = np.log(horizon)
+            z_scores = (log_horizon - log_predictions) / sigma
+            
+            if distribution == 'normal':
+                survival_probs = 1 - stats.norm.cdf(z_scores)
+            elif distribution == 'logistic':
+                survival_probs = 1 / (1 + np.exp(z_scores))
+            elif distribution == 'extreme':
+                survival_probs = np.exp(-np.exp(z_scores))
+            else:
+                survival_probs = 1 - stats.norm.cdf(z_scores)
+            
+            all_risk_scores[horizon] = 1 - np.clip(survival_probs, 1e-6, 1 - 1e-6)
+        
+        # Calculate AUC for each horizon using pre-computed scores
         for horizon in horizons:
             try:
-                # Calculate survival probability at horizon directly
-                log_horizon = np.log(horizon)
-                z_scores = (log_horizon - log_predictions) / sigma
+                predicted_risk = all_risk_scores[horizon]
                 
-                if distribution == 'normal':
-                    survival_probs = 1 - stats.norm.cdf(z_scores)
-                elif distribution == 'logistic':
-                    survival_probs = 1 / (1 + np.exp(z_scores))
-                elif distribution == 'extreme':
-                    survival_probs = np.exp(-np.exp(z_scores))
-                else:
-                    survival_probs = 1 - stats.norm.cdf(z_scores)
-                
-                predicted_risk = 1 - np.clip(survival_probs, 1e-6, 1 - 1e-6)
-                
+                # Define binary outcome at horizon
                 outcome = ((y <= horizon) & (events == 1)).astype(int)
+                
+                # Only evaluate on at-risk population
                 at_risk = y >= horizon
                 
+                # Need sufficient events and at-risk for meaningful AUC
                 if at_risk.sum() > 100 and outcome[at_risk].sum() > 10:
+                    # Use sklearn's optimized AUC calculation
+                    from sklearn.metrics import roc_auc_score
                     auc = roc_auc_score(outcome[at_risk], predicted_risk[at_risk])
                     auc_results[f'auc_{horizon}d'] = auc
                 else:
@@ -946,18 +1052,17 @@ class SurvivalEvaluation:
                 print(f"Warning: AUC calculation failed for {horizon}d: {e}")
                 auc_results[f'auc_{horizon}d'] = np.nan
         
+        # Calculate average AUC
         valid_aucs = [auc for auc in auc_results.values() if not np.isnan(auc)]
         auc_results['average_auc'] = np.mean(valid_aucs) if valid_aucs else np.nan
         
         return auc_results
-    
     def _calculate_gini(self, events: np.ndarray, X: pd.DataFrame) -> Dict:
         """
-        Methodologically corrected Gini calculation with proper risk score derivation
+        Gini calculation using proper risk scores
         """
-        
         try:
-            # Use cached predictions if available
+            # Use cached predictions
             if self._evaluation_cache and 'log_predictions' in self._evaluation_cache:
                 log_predictions = self._evaluation_cache['log_predictions']
             else:
@@ -966,9 +1071,25 @@ class SurvivalEvaluation:
                 dmatrix = self.model_engine._create_categorical_aware_dmatrix(X_processed)
                 log_predictions = self.model_engine.model.predict(dmatrix)
             
-            # Use predictions as risk scores (lower predicted time = higher risk)
-            risk_scores = -log_predictions
-            risk_scores = np.clip(risk_scores, 1e-6, 1 - 1e-6)
+            # Calculate 1-year event probability as risk score
+            # This is more interpretable than negative log predictions
+            sigma = self.model_engine.aft_parameters.sigma
+            distribution = self.model_engine.aft_parameters.distribution.value
+            
+            log_365 = np.log(365)
+            z_scores = (log_365 - log_predictions) / sigma
+            
+            if distribution == 'normal':
+                event_prob_365 = stats.norm.cdf(z_scores)
+            elif distribution == 'logistic':
+                event_prob_365 = 1 - 1 / (1 + np.exp(z_scores))
+            elif distribution == 'extreme':
+                event_prob_365 = 1 - np.exp(-np.exp(z_scores))
+            else:
+                event_prob_365 = stats.norm.cdf(z_scores)
+            
+            # Use event probability as risk score (higher = riskier)
+            risk_scores = np.clip(event_prob_365, 1e-6, 1 - 1e-6)
             
             if events.sum() == 0:
                 return {
@@ -976,22 +1097,35 @@ class SurvivalEvaluation:
                     'interpretation': 'No events to evaluate'
                 }
             
-            # Sort by risk scores (descending)
-            sorted_idx = np.argsort(risk_scores)[::-1]
-            sorted_events = events[sorted_idx]
-            
-            # Calculate cumulative capture rates
+            # VECTORIZED Gini calculation
+            n_samples = len(events)
             n_events = events.sum()
-            cumsum_events = np.cumsum(sorted_events)
-            cumsum_pop = np.arange(1, len(events) + 1) / len(events)
-            cumsum_events_norm = cumsum_events / n_events
             
-            # Gini coefficient calculation
-            gini = 2 * np.trapz(cumsum_events_norm, cumsum_pop) - 1
+            # Sort indices by risk score (descending)
+            sorted_indices = np.argsort(risk_scores)[::-1]
+            sorted_events = events[sorted_indices]
+            
+            # Cumulative sum of events (captured)
+            cumsum_events = np.cumsum(sorted_events)
+            
+            # Cumulative proportion of population
+            cumsum_pop = np.arange(1, n_samples + 1) / n_samples
+            
+            # Cumulative proportion of events captured
+            cumsum_events_prop = cumsum_events / n_events
+            
+            # Calculate Gini using trapezoidal rule
+            # Gini = 2 * Area under Lorenz curve - 1
+            gini = 2 * np.trapz(cumsum_events_prop, cumsum_pop) - 1
+            
+            # Ensure Gini is in valid range [0, 1]
+            gini = np.clip(gini, 0.0, 1.0)
             
             return {
-                'gini_coefficient': max(0.0, gini),
-                'interpretation': self._interpret_gini_coefficient(gini)
+                'gini_coefficient': gini,
+                'interpretation': self._interpret_gini_coefficient(gini),
+                'top_decile_capture': cumsum_events[n_samples // 10] / n_events,
+                'risk_score_used': '1-year event probability'
             }
             
         except Exception as e:
@@ -999,8 +1133,7 @@ class SurvivalEvaluation:
             return {
                 'gini_coefficient': np.nan,
                 'interpretation': 'Calculation failed'
-            }
-        
+            }    
         
     def _assess_survival_curve_quality_efficient(self, X: pd.DataFrame, y_true: np.ndarray, 
                                                 events: np.ndarray) -> Dict:
