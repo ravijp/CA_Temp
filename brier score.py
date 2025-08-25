@@ -367,11 +367,11 @@ class AdvancedBrierScoreCalculator:
         for i in range(n):
             if events[i] == 1 and observed_times[i] <= time_point:
                 # Event occurred by time t: actual outcome = 1
-                brier_components[i] = weights[i] * ((event_probs[i] - 1)**2)
+                brier_components[i] = weights[i] * ((event_probs[i])**2)
                 valid_mask[i] = True
             elif observed_times[i] > time_point:
                 # Survived past time t: actual outcome = 0
-                brier_components[i] = weights[i] * ((event_probs[i] - 0)**2)
+                brier_components[i] = weights[i] * ((event_probs[i] - 1)**2)
                 valid_mask[i] = True
             elif events[i] == 0 and observed_times[i] <= time_point:
                 # Censored before time t: use IPCW weight, actual outcome = 0

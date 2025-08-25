@@ -573,6 +573,9 @@ class SurvivalEvaluation:
         Returns:
             float: Expected Calibration Error
         """
+        # Actual outcomes for evaluable observations
+        actual_outcomes = ((y_true <= horizon) & (events == 1)).astype(float)
+        
         # Only use observations we can evaluate (uncensored or survived past horizon)
         evaluable_mask = (events == 1) | (y_true > horizon)
         
@@ -584,8 +587,6 @@ class SurvivalEvaluation:
         y_eval = y_true[evaluable_mask]
         events_eval = events[evaluable_mask]
         
-        # Actual outcomes for evaluable observations
-        actual_outcomes = ((y_eval <= horizon) & (events_eval == 1)).astype(float)
         
         # VECTORIZED binning using numpy
         bin_edges = np.linspace(0, 1, n_bins + 1)
@@ -1057,9 +1058,15 @@ class SurvivalEvaluation:
         auc_results['average_auc'] = np.mean(valid_aucs) if valid_aucs else np.nan
         
         return auc_results
+    
+    
     def _calculate_gini(self, events: np.ndarray, X: pd.DataFrame) -> Dict:
         """
-        Gini calculation using proper risk scores
+        Gini calculation using consistent risk definition
+        Changes:
+        1. Use predicted survival time as risk (matches C-index)
+        2. Consider ALL events, not just those by 365 days
+        3. Better risk score normalization
         """
         try:
             # Use cached predictions
@@ -1071,25 +1078,16 @@ class SurvivalEvaluation:
                 dmatrix = self.model_engine._create_categorical_aware_dmatrix(X_processed)
                 log_predictions = self.model_engine.model.predict(dmatrix)
             
-            # Calculate 1-year event probability as risk score
-            # This is more interpretable than negative log predictions
-            sigma = self.model_engine.aft_parameters.sigma
-            distribution = self.model_engine.aft_parameters.distribution.value
+            # CHANGE 1: Use predicted survival time as risk (matches C-index)
+            # Lower predicted time = higher risk
+            predicted_times = np.exp(log_predictions)
             
-            log_365 = np.log(365)
-            z_scores = (log_365 - log_predictions) / sigma
+            # Convert to risk scores: shorter time = higher risk
+            # Use negative reciprocal to align with risk interpretation
+            risk_scores = 1.0 / (predicted_times + 1.0)  # Add 1 to avoid extreme values
             
-            if distribution == 'normal':
-                event_prob_365 = stats.norm.cdf(z_scores)
-            elif distribution == 'logistic':
-                event_prob_365 = 1 - 1 / (1 + np.exp(z_scores))
-            elif distribution == 'extreme':
-                event_prob_365 = 1 - np.exp(-np.exp(z_scores))
-            else:
-                event_prob_365 = stats.norm.cdf(z_scores)
-            
-            # Use event probability as risk score (higher = riskier)
-            risk_scores = np.clip(event_prob_365, 1e-6, 1 - 1e-6)
+            # Normalize to [0, 1] range
+            risk_scores = (risk_scores - risk_scores.min()) / (risk_scores.max() - risk_scores.min() + 1e-10)
             
             if events.sum() == 0:
                 return {
@@ -1097,15 +1095,16 @@ class SurvivalEvaluation:
                     'interpretation': 'No events to evaluate'
                 }
             
-            # VECTORIZED Gini calculation
+            # CHANGE 2: Calculate Gini on ALL events (not filtered by time)
             n_samples = len(events)
             n_events = events.sum()
             
-            # Sort indices by risk score (descending)
+            # Sort by risk score (descending - highest risk first)
             sorted_indices = np.argsort(risk_scores)[::-1]
             sorted_events = events[sorted_indices]
+            sorted_risks = risk_scores[sorted_indices]
             
-            # Cumulative sum of events (captured)
+            # Cumulative sum of events captured
             cumsum_events = np.cumsum(sorted_events)
             
             # Cumulative proportion of population
@@ -1114,26 +1113,41 @@ class SurvivalEvaluation:
             # Cumulative proportion of events captured
             cumsum_events_prop = cumsum_events / n_events
             
-            # Calculate Gini using trapezoidal rule
-            # Gini = 2 * Area under Lorenz curve - 1
-            gini = 2 * np.trapz(cumsum_events_prop, cumsum_pop) - 1
+            # Calculate Gini coefficient
+            # Area under Lorenz curve
+            auc = np.trapz(cumsum_events_prop, cumsum_pop)
             
-            # Ensure Gini is in valid range [0, 1]
+            # Gini = (AUC - 0.5) / 0.5 = 2 * AUC - 1
+            gini = 2 * auc - 1
+            
+            # Ensure valid range
             gini = np.clip(gini, 0.0, 1.0)
+            
+            # CHANGE 3: Calculate additional metrics for validation
+            # Top decile capture rate
+            top_10_pct_idx = n_samples // 10
+            top_decile_capture = cumsum_events[top_10_pct_idx] / n_events if n_events > 0 else 0
+            
+            # Add debug output
+            print(f"  Gini Debug - Risk range: [{risk_scores.min():.4f}, {risk_scores.max():.4f}]")
+            print(f"  Gini Debug - Top 10% captures {top_decile_capture:.1%} of events")
             
             return {
                 'gini_coefficient': gini,
                 'interpretation': self._interpret_gini_coefficient(gini),
-                'top_decile_capture': cumsum_events[n_samples // 10] / n_events,
-                'risk_score_used': '1-year event probability'
+                'top_decile_capture': top_decile_capture,
+                'risk_definition': 'inverse_predicted_survival_time',
+                'auc_lorenz': auc
             }
             
         except Exception as e:
             print(f"Warning: Gini calculation failed: {e}")
+            import traceback
+            traceback.print_exc()
             return {
                 'gini_coefficient': np.nan,
                 'interpretation': 'Calculation failed'
-            }    
+            }
         
     def _assess_survival_curve_quality_efficient(self, X: pd.DataFrame, y_true: np.ndarray, 
                                                 events: np.ndarray) -> Dict:
