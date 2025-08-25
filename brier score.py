@@ -191,63 +191,55 @@ class IPCWEstimator:
     
     @staticmethod
     def kaplan_meier_weights(times: np.ndarray, events: np.ndarray, 
-                           eval_times: np.ndarray) -> np.ndarray:
+                        eval_times: np.ndarray) -> np.ndarray:
         """
-        Optimized KM-based IPCW weights for large datasets
+        Correct IPCW weights using Kaplan-Meier estimator for censoring distribution
         
-        Parameters:
-        -----------
-        times : Observed times
-        events : Event indicators (1=event, 0=censored)
-        eval_times : Times at which to evaluate weights
-        
-        Returns:
-        --------
-        Array of IPCW weights
+        Weight formula: w_i = δ_i / G(T_i) + (1-δ_i) / G(C_i)
+        where G is the survival function of censoring distribution
         """
         try:
             n_samples = len(times)
+            weights = np.ones(n_samples)
             
             # For very large datasets, use simplified calculation
             if n_samples > 1000000:
                 print(f"Using simplified IPCW for {n_samples:,} samples")
-                # Use uniform weights as approximation for very large datasets
-                weights = np.ones(n_samples)
-                # Adjust for censoring rate
+                # Simplified approach: uniform weights adjusted by censoring rate
                 censoring_rate = 1 - np.mean(events)
-                weights = weights / (1 - censoring_rate + 0.01)
-                return weights
+                base_weight = 1.0 / (1 - censoring_rate/2)  # Adjusted formula
+                return np.full(n_samples, base_weight)
             
-            # Standard KM approach for moderate datasets
+            # Fit KM on CENSORING distribution (not event distribution)
             kmf = KaplanMeierFitter()
-            # Fit on censoring distribution (flip events)
-            kmf.fit(times, 1 - events)
+            kmf.fit(times, 1 - events, label='Censoring')
             
-            # Vectorized weight calculation
-            weights = np.zeros(n_samples)
+            # For each observation, calculate appropriate weight
+            for i in range(n_samples):
+                t_i = times[i]
+                
+                try:
+                    # Get censoring survival probability at time t_i
+                    G_ti = kmf.survival_function_at_times(t_i).iloc[0]
+                    
+                    # Ensure G(t_i) doesn't get too small (numerical stability)
+                    G_ti = max(G_ti, 0.01)
+                    
+                    # IPCW weight (same formula for both censored and uncensored)
+                    # This is correct: ALL observations get weighted by censoring probability
+                    weights[i] = 1.0 / G_ti
+                    
+                except Exception:
+                    # If KM fails at this time point, use default weight
+                    weights[i] = 1.0
             
-            # Get survival probabilities for all unique times at once
-            unique_times = np.unique(times[events == 1])
-            if len(unique_times) > 0:
-                surv_probs = kmf.survival_function_at_times(unique_times)
-                time_to_prob = dict(zip(unique_times, surv_probs.values.flatten()))
-                
-                # Apply weights
-                for i, (t, e) in enumerate(zip(times, events)):
-                    if e == 1:  # Event occurred
-                        surv_prob = time_to_prob.get(t, 0.5)
-                        weights[i] = 1.0 / max(surv_prob, 0.01)
-                    else:  # Censored
-                        weights[i] = 0.0
-            else:
-                # No events, return uniform weights
-                weights = np.ones(n_samples)
-                
+            # Normalize weights to sum to n (optional but helps interpretation)
+            weights = weights * (n_samples / weights.sum())
+            
             return weights
             
         except Exception as e:
             print(f"Warning: IPCW calculation failed: {e}, using uniform weights")
-            # Fallback to uniform weights
             return np.ones(len(times))
     
     @staticmethod
@@ -358,42 +350,51 @@ class AdvancedBrierScoreCalculator:
         # Survival probabilities at time_point
         surv_probs = self.handler.survival_function(time_point, predictions, scale)
         
-        # Binary outcomes at time_point
-        outcomes = ((observed_times <= time_point) & (events == 1)).astype(float)
+        # Convert to EVENT probabilities for Brier score
+        event_probs = 1 - surv_probs
         
-        # Determine who is at risk at time_point
-        at_risk = observed_times >= time_point
+        # Binary outcomes at time_point (1 if event occurred by t, 0 otherwise)
+        binary_outcomes = ((observed_times <= time_point) & (events == 1)).astype(float)
         
         if weights is None:
             weights = np.ones(n)
         
-        # IPCW-adjusted Brier score calculation
+        # CORRECTED Brier score calculation
+        # BS = weighted mean of (predicted_event_prob - actual_outcome)^2
         brier_components = np.zeros(n)
         valid_mask = np.zeros(n, dtype=bool)
         
         for i in range(n):
             if events[i] == 1 and observed_times[i] <= time_point:
-                # Event before time_point
-                brier_components[i] = weights[i] * (surv_probs[i]**2)
+                # Event occurred by time t: actual outcome = 1
+                brier_components[i] = weights[i] * ((event_probs[i] - 1)**2)
                 valid_mask[i] = True
             elif observed_times[i] > time_point:
-                # At risk at time_point
-                brier_components[i] = weights[i] * ((1 - surv_probs[i])**2)
+                # Survived past time t: actual outcome = 0
+                brier_components[i] = weights[i] * ((event_probs[i] - 0)**2)
+                valid_mask[i] = True
+            elif events[i] == 0 and observed_times[i] <= time_point:
+                # Censored before time t: use IPCW weight, actual outcome = 0
+                # (they didn't have event by censoring time)
+                brier_components[i] = weights[i] * ((event_probs[i] - 0)**2)
                 valid_mask[i] = True
         
         if valid_mask.sum() == 0:
             return {'brier_score': np.nan, 'n_at_risk': 0, 'n_events': 0}
         
-        brier_score = np.mean(brier_components[valid_mask])
-        n_at_risk = at_risk.sum()
+        # Weighted average
+        total_weight = weights[valid_mask].sum()
+        brier_score = np.sum(brier_components[valid_mask]) / total_weight
+        
+        n_at_risk = (observed_times >= time_point).sum()
         n_events = ((observed_times <= time_point) & (events == 1)).sum()
         
         return {
             'brier_score': brier_score,
             'n_at_risk': n_at_risk,
             'n_events': n_events,
-            'surv_probs_mean': np.mean(surv_probs),
-            'surv_probs_std': np.std(surv_probs)
+            'event_probs_mean': np.mean(event_probs),
+            'event_probs_std': np.std(event_probs)
         }
     
     def bootstrap_confidence_intervals(self, predictions: np.ndarray,
