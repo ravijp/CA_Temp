@@ -227,3 +227,195 @@ def validate_from_smart_results(smart_test_results, t_star=None, m_grid=128):
 # )
 # for k, v in metrics.items():
 #     print(f"{k}: {v}")
+
+
+# #!/usr/bin/env python3
+
+# import numpy as np
+# from scipy import stats
+
+# def debug_validate_metrics(engine, val_df, t_star=365.0):
+#     """
+#     Debug the validate_metrics.py issues step by step
+#     """
+#     print("=== DEBUGGING VALIDATE_METRICS ISSUES ===")
+    
+#     # Extract ground truth
+#     T = np.asarray(val_df['survival_time_days'].values, float)
+#     E = np.asarray(val_df['event_indicator_vol'].values, int)
+    
+#     print(f"Dataset size: {len(T):,}")
+#     print(f"Events: {E.sum():,} ({E.mean():.3f})")
+#     print(f"Survival time range: [{T.min():.1f}, {T.max():.1f}]")
+#     print(f"t_star: {t_star}")
+    
+#     # Check t_star validity
+#     events_by_tstar = ((T <= t_star) & (E == 1)).sum()
+#     survivors_at_tstar = (T > t_star).sum()
+    
+#     print(f"\nAt t_star={t_star}:")
+#     print(f"  Events by t*: {events_by_tstar:,}")
+#     print(f"  Survivors at t*: {survivors_at_tstar:,}")
+#     print(f"  Censored before t*: {((T <= t_star) & (E == 0)).sum():,}")
+    
+#     if events_by_tstar < 10 or survivors_at_tstar < 10:
+#         print("❌ INSUFFICIENT DATA: Need at least 10 in each group for AUC")
+#         return None
+    
+#     # Get survival curves from engine
+#     try:
+#         S = np.asarray(engine.predict_survival_curves(val_df), float)
+#         print(f"\nSurvival curves shape: {S.shape}")
+#         print(f"Survival at day 1: [{S[:, 0].min():.3f}, {S[:, 0].max():.3f}]")
+        
+#         # Find index for t_star
+#         times_grid = np.arange(1.0, S.shape[1] + 1.0)
+#         idx = int(np.searchsorted(times_grid, t_star, side="right") - 1)
+#         idx = max(0, min(idx, S.shape[1] - 1))
+#         actual_t = times_grid[idx]
+        
+#         print(f"t_star={t_star} maps to grid index {idx} (actual_t={actual_t})")
+        
+#         # Check survival probabilities at t_star
+#         S_t = S[:, idx]
+#         p_event_t = 1.0 - S_t
+        
+#         print(f"\nSurvival probs at t*: [{S_t.min():.3f}, {S_t.max():.3f}]")
+#         print(f"Event probs at t*: [{p_event_t.min():.3f}, {p_event_t.max():.3f}]")
+#         print(f"Mean event prob: {p_event_t.mean():.3f}")
+        
+#         # Check for monotonicity issues
+#         non_monotonic = 0
+#         for i in range(min(100, S.shape[0])):
+#             diffs = np.diff(S[i, :])
+#             violations = (diffs > 1e-6).sum()
+#             if violations > 0:
+#                 non_monotonic += 1
+        
+#         print(f"Non-monotonic curves (sample): {non_monotonic}/100")
+        
+#         return {
+#             'T': T, 'E': E, 'S': S, 't_star': actual_t, 
+#             'p_event_t': p_event_t, 'idx': idx,
+#             'events_by_tstar': events_by_tstar,
+#             'survivors_at_tstar': survivors_at_tstar
+#         }
+        
+#     except Exception as e:
+#         print(f"❌ ENGINE ERROR: {e}")
+#         return None
+
+# def debug_auc_calculation(debug_data):
+#     """
+#     Step-by-step AUC debugging
+#     """
+#     print("\n=== DEBUGGING AUC CALCULATION ===")
+    
+#     T = debug_data['T']
+#     E = debug_data['E']
+#     p_event_t = debug_data['p_event_t']
+#     t_star = debug_data['t_star']
+    
+#     # Define cases and controls
+#     cases = (T <= t_star) & (E == 1)
+#     ctrls = T > t_star
+    
+#     print(f"Cases (events by t*): {cases.sum()}")
+#     print(f"Controls (survivors at t*): {ctrls.sum()}")
+    
+#     if not cases.any() or not ctrls.any():
+#         print("❌ AUC FAILURE: No cases or no controls")
+#         return np.nan
+    
+#     # Check risk score distributions
+#     case_risks = p_event_t[cases]
+#     ctrl_risks = p_event_t[ctrls]
+    
+#     print(f"\nRisk distributions:")
+#     print(f"  Cases: [{case_risks.min():.4f}, {case_risks.max():.4f}] (mean: {case_risks.mean():.4f})")
+#     print(f"  Controls: [{ctrl_risks.min():.4f}, {ctrl_risks.max():.4f}] (mean: {ctrl_risks.mean():.4f})")
+    
+#     # Expected: case_risks.mean() > ctrl_risks.mean() for good discrimination
+#     separation = case_risks.mean() - ctrl_risks.mean()
+#     print(f"  Separation (cases - controls): {separation:.4f}")
+    
+#     if separation < 0:
+#         print("⚠️  WARNING: Cases have lower risk than controls (directional issue)")
+    
+#     # Simple AUC without IPCW for comparison
+#     try:
+#         from sklearn.metrics import roc_auc_score
+#         y_binary = np.concatenate([np.ones(cases.sum()), np.zeros(ctrls.sum())])
+#         risk_combined = np.concatenate([case_risks, ctrl_risks])
+#         simple_auc = roc_auc_score(y_binary, risk_combined)
+#         print(f"Simple AUC (no IPCW): {simple_auc:.4f}")
+        
+#         return simple_auc
+        
+#     except Exception as e:
+#         print(f"❌ Simple AUC failed: {e}")
+#         return np.nan
+
+# def debug_cindex_calculation(debug_data):
+#     """
+#     Debug C-index calculation
+#     """
+#     print("\n=== DEBUGGING C-INDEX CALCULATION ===")
+    
+#     T = debug_data['T']
+#     E = debug_data['E']
+#     p_event_t = debug_data['p_event_t']
+    
+#     # Manual C-index calculation (small sample)
+#     n_pairs = 0
+#     concordant = 0
+#     tied = 0
+    
+#     # Sample for large datasets
+#     sample_size = min(1000, len(T))
+#     indices = np.random.choice(len(T), sample_size, replace=False)
+    
+#     T_sample = T[indices]
+#     E_sample = E[indices]
+#     r_sample = p_event_t[indices]
+    
+#     print(f"Computing C-index on sample of {sample_size}")
+    
+#     for i in range(sample_size):
+#         for j in range(i+1, sample_size):
+#             Ti, Tj = T_sample[i], T_sample[j]
+#             Ei, Ej = E_sample[i], E_sample[j]
+#             ri, rj = r_sample[i], r_sample[j]
+            
+#             # Only count comparable pairs
+#             if (Ti < Tj and Ei == 1) or (Tj < Ti and Ej == 1):
+#                 n_pairs += 1
+                
+#                 if Ti < Tj and Ei == 1:  # i had event first
+#                     if ri > rj:  # Higher risk had earlier event
+#                         concordant += 1
+#                     elif ri == rj:
+#                         tied += 1
+#                 elif Tj < Ti and Ej == 1:  # j had event first
+#                     if rj > ri:  # Higher risk had earlier event
+#                         concordant += 1
+#                     elif ri == rj:
+#                         tied += 1
+    
+#     if n_pairs > 0:
+#         c_index = (concordant + 0.5 * tied) / n_pairs
+#         print(f"Comparable pairs: {n_pairs}")
+#         print(f"Concordant: {concordant}")
+#         print(f"Tied: {tied}")
+#         print(f"C-index: {c_index:.4f}")
+        
+#         return c_index
+#     else:
+#         print("❌ No comparable pairs found")
+#         return np.nan
+
+# # Usage example:
+# # debug_data = debug_validate_metrics(engine, datasets_raw['val'])
+# # if debug_data:
+# #     debug_auc_calculation(debug_data)
+# #     debug_cindex_calculation(debug_data)
