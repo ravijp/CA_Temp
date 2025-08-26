@@ -65,22 +65,11 @@ def _step_eval(self, x_times: np.ndarray, y_vals: np.ndarray,
 # REPLACE the Brier score calculation section with:
 def calculate_survival_metrics(self, X: pd.DataFrame, y_true: np.ndarray, 
                               events: np.ndarray, use_ipcw: bool = True) -> Dict:
-    """
-    Calculate core survival analysis metrics with IPCW correction
-    
-    Args:
-        X: Feature matrix for model predictions
-        y_true: Actual survival times
-        events: Event indicators (1=event, 0=censored)
-        use_ipcw: Whether to use IPCW correction for Brier scores
-        
-    Returns:
-        Dict: Comprehensive survival metrics with confidence intervals
-    """
+    """Calculate core survival analysis metrics with IPCW correction"""
     metrics = {}
     
     try:
-        # Use cached predictions if available
+        # C-index calculation (keep existing - working correctly)
         if self._evaluation_cache and 'log_predictions' in self._evaluation_cache:
             log_predictions = self._evaluation_cache['log_predictions']
             X_processed = self._evaluation_cache['X_processed']
@@ -91,30 +80,28 @@ def calculate_survival_metrics(self, X: pd.DataFrame, y_true: np.ndarray,
             log_predictions = self.model_engine.model.predict(dmatrix)
         
         pred_times = np.exp(log_predictions)
-        
         c_index = concordance_index(y_true, pred_times, events)
         metrics['c_index'] = c_index
     except Exception as e:
         print(f"Warning: C-index calculation failed: {e}")
         metrics['c_index'] = np.nan
     
-    # IPCW-corrected Brier score calculation
+    # CORRECTED: Calculate TRUE Integrated Brier Score
     if use_ipcw:
         try:
-            # Calculate at business-relevant horizon
-            brier_horizon = 300  # Use 300 to avoid boundary issues
-            horizon_probs = self.predict_time_horizons(X, [brier_horizon])
-            predicted_probs = horizon_probs[f'{brier_horizon}d']
+            # Get full survival curves from model
+            survival_curves = self.model_engine.predict_survival_curves(X_processed)
             
-            brier_score = self._calculate_brier_score_ipcw(
-                predicted_probs, y_true, events, brier_horizon
+            # Calculate IBS by integrating over multiple time points
+            ibs = self._calculate_integrated_brier_score(
+                survival_curves, y_true, events, max_time=300
             )
-            metrics['integrated_brier_score'] = brier_score
+            metrics['integrated_brier_score'] = ibs
             
-            print(f"   Brier Score (IPCW) at {brier_horizon}d: {brier_score:.4f}")
+            print(f"   Integrated Brier Score (0-300d): {ibs:.4f}")
             
         except Exception as e:
-            print(f"Warning: IPCW Brier score calculation failed: {e}")
+            print(f"Warning: Integrated Brier Score calculation failed: {e}")
             metrics['integrated_brier_score'] = np.nan
     else:
         metrics['integrated_brier_score'] = np.nan
@@ -143,31 +130,47 @@ def _calculate_brier_score_ipcw(self, predicted_probs: np.ndarray, y_true: np.nd
         IPCW-corrected Brier score
     """
     try:
-        # Build censoring distribution
-        uniq, G_right, G_left = self._km_censoring_survival(y_true, events)
-        
         # Define outcome groups
         died_by_t = (y_true <= t_eval) & (events == 1)
         alive_at_t = y_true > t_eval
         
+        # Check if we have sufficient data
+        if died_by_t.sum() < 10 and alive_at_t.sum() < 10:
+            return np.nan
+        
         # Calculate IPCW weights
-        G_t = max(self._step_eval(uniq, G_right, np.array([t_eval]))[0], 1e-12)
+        G_t = max(self._step_eval(uniq, G_right, np.array([t_eval]))[0], 1e-8)
         
-        brier_components = np.zeros_like(predicted_probs, dtype=float)
+        # Initialize Brier components
+        total_brier = 0.0
+        total_weight = 0.0
         
-        # Events by t_eval: weighted by 1/G(T_i-)
+        # Events by t_eval: contribute (1 - predicted_prob)^2 weighted by 1/G(T_i-)
         if died_by_t.any():
-            G_T_left = np.maximum(self._step_eval(uniq, G_left, y_true[died_by_t], left=True), 1e-12)
-            brier_components[died_by_t] = ((1.0 - predicted_probs[died_by_t]) ** 2) / G_T_left
+            G_T_left = np.maximum(self._step_eval(uniq, G_left, y_true[died_by_t], left=True), 1e-8)
+            weights_event = 1.0 / G_T_left
+            
+            # Clip weights to prevent extreme values
+            weights_event = np.clip(weights_event, 0, 100)
+            
+            brier_event = weights_event * ((1.0 - predicted_probs[died_by_t]) ** 2)
+            total_brier += brier_event.sum()
+            total_weight += weights_event.sum()
         
-        # Survivors past t_eval: weighted by 1/G(t)
+        # Alive at t_eval: contribute (0 - predicted_prob)^2 weighted by 1/G(t)
         if alive_at_t.any():
-            brier_components[alive_at_t] = ((0.0 - predicted_probs[alive_at_t]) ** 2) / G_t
+            weight_alive = 1.0 / G_t
+            weight_alive = min(weight_alive, 100)  # Clip extreme weights
+            
+            brier_alive = weight_alive * (predicted_probs[alive_at_t] ** 2)
+            total_brier += brier_alive.sum()
+            total_weight += weight_alive * alive_at_t.sum()
         
-        return float(brier_components.mean())
+        # Return weighted average
+        return float(total_brier / total_weight) if total_weight > 0 else np.nan
         
     except Exception as e:
-        print(f"Warning: IPCW Brier score calculation failed: {e}")
+        print(f"Warning: Brier score calculation failed at t={t_eval}: {e}")
         return np.nan
 
 # CHANGE 6: Replace _calculate_fast_ece method (around line ~485)
@@ -188,67 +191,78 @@ def _calculate_fast_ece(self, predicted_event_probs: np.ndarray,
         IPCW-corrected Expected Calibration Error
     """
     try:
-        # Handle boundary condition: use horizon-1 if horizon equals max survival time
-        actual_horizon = horizon
-        if horizon >= y_true.max():
-            actual_horizon = int(y_true.max() - 1)
-            print(f"   Adjusting horizon from {horizon} to {actual_horizon} to avoid boundary condition")
+        # FIXED: More conservative boundary condition handling
+        controls = y_true > horizon
+        cases = (y_true <= horizon) & (events == 1)
         
-        # Consistent controls definition across all metrics
-        cases = (y_true <= actual_horizon) & (events == 1)
-        controls = y_true > actual_horizon  # People observable beyond horizon
+        # Only adjust if we have insufficient controls (< 1000)
+        actual_horizon = horizon
+        if controls.sum() < 1000:
+            actual_horizon = horizon - 1
+            controls = y_true > actual_horizon
+            cases = (y_true <= actual_horizon) & (events == 1)
+            print(f"   ECE: Adjusted horizon {horizon} -> {actual_horizon} (controls: {controls.sum():,})")
         
         print(f"   ECE at {actual_horizon}d: cases={cases.sum():,}, controls={controls.sum():,}")
         
         # Build censoring distribution
         uniq, G_right, G_left = self._km_censoring_survival(y_true, events)
         
-        T = np.asarray(y_true, float)
-        E = np.asarray(events, int)
-        p = np.asarray(predicted_event_probs, float)
+        # FIXED: Proper IPCW weight calculation
+        G_t = max(self._step_eval(uniq, G_right, np.array([actual_horizon]))[0], 1e-8)
         
-        # Calculate IPCW weights
-        G_t = max(self._step_eval(uniq, G_right, np.array([actual_horizon]))[0], 1e-12)
+        # Calculate weights for each observation
+        weights = np.zeros_like(y_true, dtype=float)
         
-        w_event = np.zeros_like(T, dtype=float)
-        w_alive = np.zeros_like(T, dtype=float)
-        
+        # Events get weight 1/G(T_i-)
         if cases.any():
-            w_event[cases] = 1.0 / np.maximum(
-                self._step_eval(uniq, G_left, T[cases], left=True), 1e-12)
+            G_T_left = np.maximum(self._step_eval(uniq, G_left, y_true[cases], left=True), 1e-8)
+            weights[cases] = np.clip(1.0 / G_T_left, 0, 50)  # Clip extreme weights
         
-        w_alive[controls] = 1.0 / G_t
+        # Controls get weight 1/G(t)
+        if controls.any():
+            weight_control = min(1.0 / G_t, 50)  # Clip extreme weights
+            weights[controls] = weight_control
         
-        total_weights = w_event + w_alive
-        if total_weights.sum() == 0:
+        # Only include observations with positive weights
+        valid_mask = weights > 0
+        if valid_mask.sum() < 100:
             return np.nan
         
-        # Quantile-based binning for stability
-        edges = np.quantile(p, np.linspace(0, 1, n_bins + 1))
-        edges[0], edges[-1] = -np.inf, np.inf
-        bins = np.digitize(p, edges[1:-1], right=False)
+        p_valid = predicted_event_probs[valid_mask]
+        w_valid = weights[valid_mask]
+        outcome_valid = cases[valid_mask].astype(float)  # 1 for events, 0 for controls
         
-        total = total_weights.sum()
+        # FIXED: Proper weighted calibration calculation
+        edges = np.quantile(p_valid, np.linspace(0, 1, n_bins + 1))
+        edges[0], edges[-1] = -np.inf, np.inf
+        bins = np.digitize(p_valid, edges[1:-1], right=False)
+        
+        total_weight = w_valid.sum()
         ece = 0.0
         
         for b in range(n_bins):
             bin_mask = bins == b
             if not bin_mask.any():
                 continue
+                
+            bin_weights = w_valid[bin_mask]
+            bin_weight_sum = bin_weights.sum()
             
-            denom_b = total_weights[bin_mask].sum()
-            if denom_b <= 0:
+            if bin_weight_sum <= 0:
                 continue
             
             # Weighted averages within bin
-            pred_b = float((p[bin_mask] * total_weights[bin_mask]).sum() / denom_b)
-            obs_b = float(w_event[bin_mask].sum() / denom_b)
-            ece += (denom_b / total) * abs(pred_b - obs_b)
+            pred_avg = np.average(p_valid[bin_mask], weights=bin_weights)
+            obs_avg = np.average(outcome_valid[bin_mask], weights=bin_weights)
+            
+            # Add to ECE
+            ece += (bin_weight_sum / total_weight) * abs(pred_avg - obs_avg)
         
         return float(ece)
         
     except Exception as e:
-        print(f"Warning: IPCW ECE calculation failed for {horizon}d: {e}")
+        print(f"Warning: ECE calculation failed for {horizon}d: {e}")
         return np.nan
 
 # CHANGE 7: Update _calculate_time_dependent_auc method (around line ~600)
@@ -424,3 +438,61 @@ def _setup_evaluation_cache(self, X: pd.DataFrame, y: np.ndarray, event: np.ndar
     except Exception as e:
         print(f"Warning: Failed to setup evaluation cache: {e}")
         self._evaluation_cache = {}
+        
+# Change 10: Add TRUE Integrated Brier Score calculation
+
+def _calculate_integrated_brier_score(self, survival_curves: np.ndarray, 
+                                    y_true: np.ndarray, events: np.ndarray, 
+                                    max_time: int = 300, n_points: int = 30) -> float:
+    """
+    Calculate true Integrated Brier Score by integrating over time
+    
+    Args:
+        survival_curves: Model survival curves (n_samples, n_timepoints)
+        y_true: Actual survival times
+        events: Event indicators  
+        max_time: Maximum integration time
+        n_points: Number of time points for integration
+        
+    Returns:
+        Integrated Brier Score averaged over [1, max_time]
+    """
+    try:
+        # Create time grid for integration
+        time_points = np.linspace(1, max_time, n_points)
+        brier_scores = []
+        
+        # Build censoring distribution once
+        uniq, G_right, G_left = self._km_censoring_survival(y_true, events)
+        
+        for t in time_points:
+            try:
+                # Get survival probability at time t
+                t_idx = min(int(t - 1), survival_curves.shape[1] - 1)  # Convert to 0-indexed
+                survival_probs = survival_curves[:, t_idx]
+                event_probs = 1 - survival_probs
+                
+                # Calculate Brier score at this time point
+                bs = self._calculate_brier_score_ipcw(
+                    event_probs, y_true, events, int(t), uniq, G_right, G_left
+                )
+                
+                if not np.isnan(bs):
+                    brier_scores.append(bs)
+                    
+            except Exception as e:
+                print(f"Warning: Brier score calculation failed at t={t}: {e}")
+                continue
+        
+        if len(brier_scores) < 2:
+            return np.nan
+        
+        # Integrate using trapezoidal rule
+        valid_times = time_points[:len(brier_scores)]
+        ibs = np.trapz(brier_scores, valid_times) / (valid_times[-1] - valid_times[0])
+        
+        return float(ibs)
+        
+    except Exception as e:
+        print(f"Warning: IBS calculation failed: {e}")
+        return np.nan
