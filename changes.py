@@ -130,6 +130,9 @@ def _calculate_brier_score_ipcw(self, predicted_probs: np.ndarray, y_true: np.nd
         IPCW-corrected Brier score
     """
     try:
+        # Build censoring distribution
+        uniq, G_right, G_left = self._km_censoring_survival(y_true, events)
+        
         # Define outcome groups
         died_by_t = (y_true <= t_eval) & (events == 1)
         alive_at_t = y_true > t_eval
