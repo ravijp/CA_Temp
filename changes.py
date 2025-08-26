@@ -61,7 +61,7 @@ def _step_eval(self, x_times: np.ndarray, y_vals: np.ndarray,
 # REMOVE this method entirely:
 # def _initialize_brier_calculator(self) -> None:
 
-# CHANGE 4: Update calculate_survival_metrics method (around line ~300)
+# CHANGE 4: Update calculate_survival_metrics method (around line ~364)
 # REPLACE the Brier score calculation section with:
 def calculate_survival_metrics(self, X: pd.DataFrame, y_true: np.ndarray, 
                               events: np.ndarray, use_ipcw: bool = True) -> Dict:
@@ -94,11 +94,11 @@ def calculate_survival_metrics(self, X: pd.DataFrame, y_true: np.ndarray,
             
             # Calculate IBS by integrating over multiple time points
             ibs = self._calculate_integrated_brier_score(
-                survival_curves, y_true, events, max_time=300
+                survival_curves, y_true, events, max_time=364
             )
             metrics['integrated_brier_score'] = ibs
             
-            print(f"   Integrated Brier Score (0-300d): {ibs:.4f}")
+            print(f"   Integrated Brier Score (0-364d): {ibs:.4f}")
             
         except Exception as e:
             print(f"Warning: Integrated Brier Score calculation failed: {e}")
@@ -392,8 +392,8 @@ def _calculate_gini(self, events: np.ndarray, X: pd.DataFrame) -> Dict:
         
         y_true = self._evaluation_cache['y_true']
         
-        # Use 300-day horizon to avoid boundary issues while maintaining business relevance
-        horizon = 300
+        # Use 364-day horizon to avoid boundary issues while maintaining business relevance
+        horizon = 364
         
         # Calculate AUC using consistent IPCW method
         auc_results = self._calculate_time_dependent_auc(X, y_true, events, [horizon])
@@ -443,7 +443,7 @@ def _setup_evaluation_cache(self, X: pd.DataFrame, y: np.ndarray, event: np.ndar
 
 def _calculate_integrated_brier_score(self, survival_curves: np.ndarray, 
                                     y_true: np.ndarray, events: np.ndarray, 
-                                    max_time: int = 300, n_points: int = 30) -> float:
+                                    max_time: int = 364, n_points: int = 30) -> float:
     """
     Calculate true Integrated Brier Score by integrating over time
     
