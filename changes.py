@@ -499,3 +499,200 @@ def _calculate_integrated_brier_score(self, survival_curves: np.ndarray,
     except Exception as e:
         print(f"Warning: IBS calculation failed: {e}")
         return np.nan
+
+
+# ##########################################
+# ##########################################
+# ##########################################
+# ##########################################
+# LOCATION 1: evaluate_model_performance method (around line ~200)
+# Add at the START of the method, after the print statement
+
+def evaluate_model_performance(self, datasets: Dict[str, Tuple]) -> Dict:
+    """SINGLE SOURCE OF TRUTH for all performance metrics"""
+    print("=== COMPREHENSIVE MODEL PERFORMANCE EVALUATION ===")
+    
+    performance_results = {}
+    
+    for dataset_name, (X, y, event) in datasets.items():
+        print(f"\nEvaluating {dataset_name.upper()} dataset ({len(X):,} records)...")
+        
+        # ADD THESE DIAGNOSTIC PRINTS
+        print(f"DEBUG - Dataset shapes: X={X.shape}, y={y.shape}, events={event.shape}")
+        print(f"DEBUG - Event rate: {event.mean():.4f}, Survival range: [{y.min():.0f}, {y.max():.0f}]")
+        print(f"DEBUG - Cache keys before setup: {list(self._evaluation_cache.keys())}")
+        
+        self._validate_input_data(X, y, event)
+        
+        # Clear cache from previous dataset
+        self._clear_evaluation_cache()
+        
+        # ADD THIS DIAGNOSTIC PRINT
+        print(f"DEBUG - Cache cleared, keys: {list(self._evaluation_cache.keys())}")
+        
+        # Setup evaluation cache with predictions computed ONCE
+        self._setup_evaluation_cache(X, y, event)
+        
+        # ADD THIS DIAGNOSTIC PRINT  
+        print(f"DEBUG - Cache setup complete, keys: {list(self._evaluation_cache.keys())}")
+        print(f"DEBUG - Cache dataset size: {self._evaluation_cache.get('dataset_size', 'MISSING')}")
+
+# LOCATION 2: _calculate_fast_ece method (around line ~485)
+# Add after the controls/cases calculation
+
+def _calculate_fast_ece(self, predicted_event_probs: np.ndarray, 
+                        y_true: np.ndarray, events: np.ndarray, 
+                        horizon: int, n_bins: int = 10) -> float:
+    # ... existing code until controls definition ...
+    
+    controls = y_true > horizon
+    cases = (y_true <= horizon) & (events == 1)
+    
+    # ADD THESE DIAGNOSTIC PRINTS
+    print(f"DEBUG ECE - Raw y_true shape: {y_true.shape}, unique values: {len(np.unique(y_true))}")
+    print(f"DEBUG ECE - Horizon {horizon}: cases={cases.sum():,}, controls={controls.sum():,}, total={len(y_true):,}")
+    print(f"DEBUG ECE - Cases+Controls+Censored: {cases.sum() + controls.sum() + ((y_true <= horizon) & (events == 0)).sum():,}")
+    
+    # Only adjust if we have insufficient controls (< 1000)
+    actual_horizon = horizon
+    if controls.sum() < 1000:
+        actual_horizon = horizon - 1
+        controls = y_true > actual_horizon
+        cases = (y_true <= actual_horizon) & (events == 1)
+        print(f"   ECE: Adjusted horizon {horizon} -> {actual_horizon} (controls: {controls.sum():,})")
+    
+    print(f"   ECE at {actual_horizon}d: cases={cases.sum():,}, controls={controls.sum():,}")
+
+# LOCATION 3: _calculate_time_dependent_auc method (around line ~600)  
+# Add after the controls/cases calculation
+
+def _calculate_time_dependent_auc(self, X: pd.DataFrame, y: np.ndarray, 
+                             events: np.ndarray, horizons: List[int]) -> Dict:
+    # ... existing code until the horizon loop ...
+    
+    for horizon in horizons:
+        try:
+            # Handle boundary condition
+            actual_horizon = horizon
+            if horizon >= y.max():
+                actual_horizon = int(y.max() - 1)
+                print(f"   Adjusting AUC horizon from {horizon} to {actual_horizon}")
+            
+            # Consistent controls definition
+            cases = (y <= actual_horizon) & (events == 1)
+            controls = y > actual_horizon
+            
+            # ADD THESE DIAGNOSTIC PRINTS
+            print(f"DEBUG AUC - y shape: {y.shape}, events shape: {events.shape}")
+            print(f"DEBUG AUC - Horizon {actual_horizon}: cases={cases.sum():,}, controls={controls.sum():,}, total={len(y):,}")
+            print(f"DEBUG AUC - Cases+Controls+Censored: {cases.sum() + controls.sum() + ((y <= actual_horizon) & (events == 0)).sum():,}")
+            
+            print(f"   AUC at {actual_horizon}d: cases={cases.sum():,}, controls={controls.sum():,}")
+
+# LOCATION 4: _calculate_gini method (around line ~700)
+# Add after retrieving cached y_true
+
+def _calculate_gini(self, events: np.ndarray, X: pd.DataFrame) -> Dict:
+    try:
+        # Check if we have cached y_true
+        if 'y_true' not in self._evaluation_cache:
+            print("Warning: No cached y_true for Gini calculation")
+            return {'gini_coefficient': np.nan, 'interpretation': 'No cached survival times'}
+        
+        y_true = self._evaluation_cache['y_true']
+        
+        # ADD THESE DIAGNOSTIC PRINTS
+        print(f"DEBUG GINI - Retrieved y_true shape: {y_true.shape}")
+        print(f"DEBUG GINI - events shape: {events.shape}")
+        print(f"DEBUG GINI - y_true range: [{y_true.min():.0f}, {y_true.max():.0f}]")
+        print(f"DEBUG GINI - Shapes match: {y_true.shape == events.shape}")
+        
+        # Use 300-day horizon to avoid boundary issues while maintaining business relevance
+        horizon = 300
+        
+        # Calculate AUC using consistent IPCW method
+        auc_results = self._calculate_time_dependent_auc(X, y_true, events, [horizon])
+
+# LOCATION 5: _calculate_integrated_brier_score method (around line ~350)
+# Add at the beginning and during the loop
+
+def _calculate_integrated_brier_score(self, survival_curves: np.ndarray, 
+                                    y_true: np.ndarray, events: np.ndarray, 
+                                    max_time: int = 300, n_points: int = 30) -> float:
+    try:
+        # ADD THESE DIAGNOSTIC PRINTS
+        print(f"DEBUG IBS - Survival curves shape: {survival_curves.shape}")
+        print(f"DEBUG IBS - y_true shape: {y_true.shape}, events shape: {events.shape}")
+        print(f"DEBUG IBS - Integration: max_time={max_time}, n_points={n_points}")
+        
+        # Create time grid for integration
+        time_points = np.linspace(1, max_time, n_points)
+        brier_scores = []
+        
+        valid_scores = 0
+        for i, t in enumerate(time_points):
+            try:
+                # Get survival probability at time t
+                t_idx = min(int(t - 1), survival_curves.shape[1] - 1)
+                survival_probs = survival_curves[:, t_idx]
+                event_probs = 1 - survival_probs
+                
+                # Call existing method that builds its own censoring distribution
+                bs = self._calculate_brier_score_ipcw(event_probs, y_true, events, int(t))
+                
+                if not np.isnan(bs):
+                    brier_scores.append(bs)
+                    valid_scores += 1
+                    
+                # ADD PROGRESS PRINTS EVERY 10 TIME POINTS
+                if i % 10 == 0:
+                    print(f"DEBUG IBS - t={t:.1f}, BS={bs:.4f}, valid_scores={valid_scores}")
+                    
+            except Exception as e:
+                print(f"Warning: Brier score calculation failed at t={t}: {e}")
+                continue
+        
+        # ADD FINAL DIAGNOSTIC PRINT
+        print(f"DEBUG IBS - Final: {len(brier_scores)} valid scores out of {len(time_points)} time points")
+        
+        if len(brier_scores) < 2:
+            return np.nan
+        
+        valid_times = time_points[:len(brier_scores)]
+        ibs = np.trapz(brier_scores, valid_times) / (valid_times[-1] - valid_times[0])
+        
+        # ADD FINAL IBS CALCULATION PRINT
+        print(f"DEBUG IBS - Integration result: {ibs:.6f}")
+        
+        return float(ibs)
+
+# LOCATION 6: _setup_evaluation_cache method (around line ~250)
+# Add diagnostic prints for cache setup
+
+def _setup_evaluation_cache(self, X: pd.DataFrame, y: np.ndarray, event: np.ndarray) -> None:
+    """Setup evaluation cache with all required data for IPCW calculations"""
+    try:
+        print(f"DEBUG CACHE - Setting up cache with X.shape={X.shape}, y.shape={y.shape}, event.shape={event.shape}")
+        
+        X_processed = self._get_processed_features(X)
+        dmatrix = self.model_engine._create_categorical_aware_dmatrix(X_processed)
+        log_predictions = self.model_engine.model.predict(dmatrix)
+        
+        print(f"DEBUG CACHE - Processed X.shape={X_processed.shape}, predictions.shape={log_predictions.shape}")
+        
+        self._evaluation_cache = {
+            'X_processed': X_processed,
+            'dmatrix': dmatrix,
+            'log_predictions': log_predictions,
+            'dataset_size': len(X),
+            'y_true': y,      
+            'events': event   
+        }
+        
+        print(f"DEBUG CACHE - Cache setup successful, y_true.shape={y.shape}, events.shape={event.shape}")
+        
+    except Exception as e:
+        print(f"Warning: Failed to setup evaluation cache: {e}")
+        self._evaluation_cache = {}
+        print(f"DEBUG CACHE - Cache setup FAILED, reset to empty dict")
+        
